@@ -25,7 +25,6 @@ except ImportError:
     _cortex_complete = None
     HAS_CORTEX_PY = False
 
-
 # Lazy session import to avoid circular imports.
 def _get_session():
     """Lazy import of the Snowflake session created in nexus.vector_store.

@@ -26,7 +26,6 @@ OUTPUT CONTRACT (STRICT):
   infer RAW landing columns.
 """.strip()
 
-
 def quick_go_raw_vault_dbt_codegen_context(rv_sql: str, sttm_csv: str) -> str:
     return (
         "INPUT: DATA VAULT MODEL\n"

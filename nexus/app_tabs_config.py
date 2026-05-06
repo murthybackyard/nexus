@@ -14,6 +14,7 @@ import json
 import os
 from typing import Dict, List, Tuple
 
+
 TAB_KEYS_ORDER: List[str] = [
     "quick_go",
     "reverse_engineering",
