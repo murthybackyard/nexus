@@ -11711,167 +11711,189 @@ def _render_tab_forward():
 def _render_tab_view():
     st.markdown("#### View stored artifacts")
     st.caption(
-        f"Browse all artifact bundles in stage "
-        f"`@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE}`. "
-        f"Bundles marked ✦ have been vectorized."
+        f"Browse artifact bundles previously uploaded to stage "
+        f"`@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE}` and indexed "
+        f"in the vector tables. Pick a version to reload the full "
+        f"artifact set — displayed exactly as in Reverse Engineering."
     )
 
-    # ── Primary source: every ZIP on stage ───────────────────────────────
-    bundles = list_stage_bundles(session)
-
-    # ── Secondary source: vector-table entries for chunk counts ──────────
     try:
-        versions_df = list_stored_versions(session)
+        session.sql(
+            f"ALTER STAGE {VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE} REFRESH"
+        ).collect()
     except Exception:
-        versions_df = pd.DataFrame()
+        pass
 
-    # Build a lookup: version_slug → list of vector rows (one per phase)
-    _vec_index: dict = {}
-    if not versions_df.empty:
-        for _, vrow in versions_df.iterrows():
-            _vec_index.setdefault(vrow["version"], []).append(vrow)
+    try:
+        stage_versions = session.sql(f"""
+            SELECT
+                REGEXP_SUBSTR(RELATIVE_PATH, '^[^/]+') AS FOLDER_NAME,
+                REGEXP_REPLACE(REGEXP_SUBSTR(RELATIVE_PATH, '^[^/]+'), '^v', '') AS VERSION,
+                RELATIVE_PATH,
+                SIZE
+            FROM DIRECTORY(@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE})
+            WHERE RELATIVE_PATH LIKE '%artifacts_v%.zip'
+            ORDER BY VERSION
+        """).to_pandas()
+    except Exception as e:
+        stage_versions = pd.DataFrame()
+        st.error(f"Could not list stage bundles: {e}")
 
-    col1, col2 = st.columns([3, 1])
-    load_clicked = col2.button(
-        "🔄 Reload",
-        use_container_width=True,
-        key="view_reload",
-        help="Refresh the list of stored bundles",
-    )
-    if load_clicked:
-        st.rerun()
+    try:
+        vector_df = session.sql(f"""
+            SELECT VERSION, EMBEDDING_MODEL,
+                   COUNT(*) AS CHUNK_COUNT,
+                   COUNT(DISTINCT DATA_DOMAIN) AS DOMAIN_COUNT,
+                   COUNT(DISTINCT ARTIFACT_TYPE) AS TYPE_COUNT
+            FROM {_fqn('ARTIFACT_VECTORS_768')}
+            GROUP BY VERSION, EMBEDDING_MODEL
+        """).to_pandas()
+    except Exception:
+        vector_df = pd.DataFrame()
 
-    if not bundles:
+    if stage_versions.empty:
         st.info(
-            "No artifact bundles found on stage yet. Generate artifacts "
-            "in the **Reverse Engineering** tab and upload them to stage."
+            "No versioned artifact bundles found on stage. Generate "
+            "artifacts in the **Reverse Engineering** tab, then use "
+            "**Store as vector embeddings** to publish a version."
         )
-        return
-
-    def _bundle_label(b):
-        slug = b["version_slug"]
-        vec = _vec_index.get(slug, [])
-        total_chunks = sum(r["chunk_count"] for r in vec)
-        ts = str(b.get("last_modified", ""))[:19]
-        badge = " ✦" if vec else ""
-        size_kb = b["size"] // 1024
-        label = f"v{slug}{badge}  ·  {size_kb:,} KB"
-        if total_chunks:
-            label += f"  ·  {total_chunks} vectors"
-        if ts:
-            label += f"  ·  {ts}"
-        return label
-
-    opts = [_bundle_label(b) for b in bundles]
-    chosen_label = col1.selectbox(
-        "Select a stage bundle  (✦ = vectorized)",
-        opts,
-        index=0,
-        key="view_version_select",
-    )
-    if not chosen_label and opts:
-        chosen_label = opts[0]
-    chosen_bundle = bundles[opts.index(chosen_label)]
-    chosen_version = chosen_bundle["version_slug"]
-
-    # ── Vector metadata card (only for vectorized bundles) ───────────────
-    vec_rows = _vec_index.get(chosen_version, [])
-    if vec_rows:
-        total_chunks  = sum(r["chunk_count"]  for r in vec_rows)
-        total_domains = max(r["domain_count"] for r in vec_rows)
-        total_types   = max(r["type_count"]   for r in vec_rows)
-        app_name      = vec_rows[0]["application_name"]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("App", app_name)
-        c2.metric("Total chunks", total_chunks)
-        c3.metric("Domains", total_domains)
-        c4.metric("Artifact types", total_types)
-
-        # Domain breakdown from the first phase table that has data
-        try:
-            first = vec_rows[0]
-            dom_rows = session.sql(f"""
-                SELECT DATA_DOMAIN,
-                       COUNT(*)                      AS CHUNKS,
-                       COUNT(DISTINCT ARTIFACT_TYPE) AS TYPES,
-                       COUNT(DISTINCT ENTITY)        AS ENTITIES
-                FROM {_fqn(first['table'])}
-                WHERE VERSION = ? AND EMBEDDING_MODEL = ?
-                GROUP BY DATA_DOMAIN
-                ORDER BY CHUNKS DESC
-            """, params=[chosen_version, first["model"]]).to_pandas()
-        except Exception:
-            dom_rows = pd.DataFrame()
-
-        if not dom_rows.empty:
-            with st.expander(
-                f"Domain breakdown for v{chosen_version}",
-                expanded=False,
-            ):
-                st.dataframe(
-                    dom_rows, use_container_width=True, hide_index=True
-                )
     else:
-        st.info(
-            f"Bundle `v{chosen_version}` is on stage but has not been "
-            f"vectorized yet. Use **Store as vectors** to index it."
+        version_list = stage_versions["VERSION"].tolist()
+        path_map = dict(zip(stage_versions["VERSION"], stage_versions["RELATIVE_PATH"]))
+        size_map = dict(zip(stage_versions["VERSION"], stage_versions["SIZE"]))
+        folder_map = dict(zip(stage_versions["VERSION"], stage_versions["FOLDER_NAME"]))
+
+        indexed_versions = set(vector_df["VERSION"].tolist()) if not vector_df.empty else set()
+
+        def _opt_label(ver):
+            status = "✅" if ver in indexed_versions else "📦"
+            sz = int(size_map.get(ver, 0)) // 1024
+            parts = [f"{status} v{ver}", f"{sz} KB"]
+            if ver in indexed_versions and not vector_df.empty:
+                vrow = vector_df[vector_df["VERSION"] == ver]
+                if not vrow.empty:
+                    parts.append(f"{int(vrow.iloc[0]['CHUNK_COUNT'])} chunks")
+                    parts.append(f"{int(vrow.iloc[0]['DOMAIN_COUNT'])} domains")
+            else:
+                parts.append("stage only")
+            return "  ·  ".join(parts)
+
+        opts = [_opt_label(v) for v in version_list]
+
+        col1, col2 = st.columns([3, 1])
+        chosen_label = col1.selectbox(
+            "Select a stored version",
+            opts,
+            index=0,
+            key="view_version_select",
+        )
+        load_clicked = col2.button(
+            "🔄 Reload",
+            use_container_width=True,
+            key="view_reload",
+            help="Refresh the list of stored versions",
+        )
+        if load_clicked:
+            st.rerun()
+        if not chosen_label and opts:
+            chosen_label = opts[0]
+        chosen_idx = opts.index(chosen_label)
+        chosen_version = version_list[chosen_idx]
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Version", chosen_version)
+        c2.metric("Size", f"{int(size_map.get(chosen_version, 0)) // 1024} KB")
+        c3.metric("Status", "Indexed" if chosen_version in indexed_versions else "Stage only")
+
+        if chosen_version in indexed_versions and not vector_df.empty:
+            vrow = vector_df[vector_df["VERSION"] == chosen_version]
+            if not vrow.empty:
+                c1b, c2b, c3b = st.columns(3)
+                c1b.metric("Chunks", int(vrow.iloc[0]["CHUNK_COUNT"]))
+                c2b.metric("Domains", int(vrow.iloc[0]["DOMAIN_COUNT"]))
+                c3b.metric("Artifact types", int(vrow.iloc[0]["TYPE_COUNT"]))
+
+                try:
+                    dom_rows = session.sql(f"""
+                        SELECT DATA_DOMAIN,
+                               COUNT(*)                      AS CHUNKS,
+                               COUNT(DISTINCT ARTIFACT_TYPE) AS TYPES,
+                               COUNT(DISTINCT ENTITY)        AS ENTITIES
+                        FROM {_fqn('ARTIFACT_VECTORS_768')}
+                        WHERE VERSION = '{chosen_version}'
+                              AND EMBEDDING_MODEL = '{vrow.iloc[0]["EMBEDDING_MODEL"]}'
+                        GROUP BY DATA_DOMAIN
+                        ORDER BY CHUNKS DESC
+                    """).to_pandas()
+                except Exception:
+                    dom_rows = pd.DataFrame()
+
+                if not dom_rows.empty:
+                    with st.expander(
+                        f"Domain breakdown for v{chosen_version}",
+                        expanded=False,
+                    ):
+                        st.dataframe(
+                            dom_rows, use_container_width=True, hide_index=True
+                        )
+
+        stage_path = f"@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE}/{path_map[chosen_version]}"
+        st.caption(
+            f"Loading from stage: `{stage_path}` "
+            f"({int(size_map.get(chosen_version, 0)):,} bytes)"
         )
 
-    # ── Load and render the bundle ────────────────────────────────────────
-    bundle = chosen_bundle
-    st.caption(
-        f"Loading from stage: `{bundle['path']}` "
-        f"({bundle['size']:,} bytes)"
-    )
-
-    cache_key = f"view_loaded::{chosen_version}"
-    if st.session_state.get("view_active_key") != cache_key:
-        try:
-            with st.spinner(
-                f"Downloading and unpacking v{chosen_version}…"
-            ):
-                loaded = load_artifacts_from_stage(
-                    session, bundle["path"]
-                )
-            st.session_state[cache_key]      = loaded
-            st.session_state.view_active_key = cache_key
-        except Exception as e:
-            st.error(f"Failed to load bundle: {e}")
-            loaded = None
-    else:
-        loaded = st.session_state.get(cache_key)
-
-    if loaded:
-        arts = loaded.get("artifacts") or {}
-        src_fn = loaded.get("source_filename") or "—"
-        st.markdown(
-            f"**Source files (at generation time):** `{src_fn}`  "
-            f"·  **Artifacts in bundle:** {len(arts)}"
-        )
-
-        try:
-            stream = session.file.get_stream(bundle["path"])
-            zb = stream.read()
-            st.download_button(
-                f"📦 Download this bundle (v{chosen_version})",
-                data=zb,
-                file_name=bundle["filename"],
-                mime="application/zip",
-                use_container_width=True,
-                key=f"view_dl_bundle_{chosen_version}",
-            )
-        except Exception:
-            pass
-
-        if arts:
-            st.markdown("---")
-            st.markdown("#### Artifacts")
-            render_artifacts(
-                arts,
-                key_prefix=f"view_{chosen_version}"
-            )
+        cache_key = f"view_loaded::{chosen_version}"
+        if st.session_state.get("view_active_key") != cache_key:
+            try:
+                with st.spinner(
+                    f"Downloading and unpacking v{chosen_version}…"
+                ):
+                    loaded = load_artifacts_from_stage(session, stage_path)
+                st.session_state[cache_key] = loaded
+                st.session_state.view_active_key = cache_key
+            except Exception as e:
+                st.error(f"Failed to load bundle: {e}")
+                loaded = None
         else:
-            st.info("Bundle was loaded but contained no artifacts (empty manifest).")
+            loaded = st.session_state.get(cache_key)
+
+        if loaded:
+            arts = loaded.get("artifacts") or {}
+            src_fn = loaded.get("source_filename") or "—"
+            st.markdown(
+                f"**Source files (at generation time):** `{src_fn}`  "
+                f"·  **Artifacts in bundle:** {len(arts)}"
+            )
+
+            try:
+                stream = session.file.get_stream(stage_path)
+                zb = stream.read()
+                filename = path_map[chosen_version].split("/")[-1]
+                st.download_button(
+                    f"📦 Download this bundle (v{chosen_version})",
+                    data=zb,
+                    file_name=filename,
+                    mime="application/zip",
+                    use_container_width=True,
+                    key=f"view_dl_bundle_{chosen_version}",
+                )
+            except Exception:
+                pass
+
+            if arts:
+                st.markdown("---")
+                st.markdown("#### Artifacts")
+                render_artifacts(
+                    arts,
+                    key_prefix=f"view_{chosen_version}"
+                )
+            else:
+                st.info(
+                    "Bundle was loaded but contained no artifacts "
+                    "(empty manifest)."
+                )
+
 
 
 _tab_vis = get_tab_visibility()
