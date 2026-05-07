@@ -25,6 +25,7 @@ except ImportError:
     _cortex_complete = None
     HAS_CORTEX_PY = False
 
+
 # Lazy session import to avoid circular imports.
 def _get_session():
     """Lazy import of the Snowflake session created in nexus.vector_store.
@@ -90,12 +91,14 @@ def call_cortex(model_id: str, prompt: str, temperature: float = 0.2,
     return row[0]["RESPONSE"] if row else ""
 
 EMBED_MODELS = {
-    # label shown in UI : (cortex model name, dimension, table)
-    "Arctic Embed M (768d, faster)": (
-        "snowflake-arctic-embed-m", 768, "ARTIFACT_VECTORS_768"
-    ),
+    # label shown in UI : (cortex model name, dimension)
+    # Only 1024d models are compatible with the phase-specific vector tables
+    # (VECTORS_REVERSE_ENG, VECTORS_FORWARD_ENG, VECTORS_RESULTS).
     "Arctic Embed L v2.0 (1024d, higher quality)": (
-        "snowflake-arctic-embed-l-v2.0", 1024, "ARTIFACT_VECTORS_1024"
+        "snowflake-arctic-embed-l-v2.0", 1024
+    ),
+    "Arctic Embed M (768d, faster)": (
+        "snowflake-arctic-embed-m", 768
     ),
 }
 

@@ -31,7 +31,6 @@ no Streamlit, no Snowflake calls. The orchestration that calls them
 in the right order lives in nexus.dbt_pipeline.
 """
 
-
 import json
 import re
 from typing import Dict, List, Optional, Tuple
@@ -63,6 +62,18 @@ RAW_VAULT_SCHEMA = "RAW_VAULT"
 BUSINESS_VAULT_SCHEMA = "BUSINESS_VAULT"
 
 SNOWFLAKE_NATIVE_DBT_VERSION = "1.9.4"
+
+# ── Phase-specific vector table names ────────────────────────────────────────
+# Three separate 1024-dimensional tables, one per engineering phase.
+# All use APPLICATION_NAME + VERSION as the deduplication namespace so the
+# same pipeline can be run multiple times without re-embedding unchanged data.
+VECTORS_REVERSE_ENG = "VECTORS_REVERSE_ENG"
+VECTORS_FORWARD_ENG = "VECTORS_FORWARD_ENG"
+VECTORS_RESULTS     = "VECTORS_RESULTS"
+APP_RUN_REGISTRY    = "APP_RUN_REGISTRY"
+
+# Dimension fixed for all three phase tables.
+PHASE_TABLE_DIM = 1024
 
 # ── Scaffold templates used by the dbt deploy pipeline ───────────────────────
 _SCAFFOLD_PACKAGES_YML = """packages:

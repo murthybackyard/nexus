@@ -43,7 +43,6 @@ Contents:
       BUSINESS_VAULT_GUIDE
 """
 
-
 import re
 from typing import Dict, List, Optional
 
@@ -320,7 +319,42 @@ First chars must be `-- === DIMENSIONS ===`.
 
 def build_forward_sttm_prompt(bv_narrative_md, reverse_summary,
                               dashboard_type,
-                              sttm_template_text: str = ""):
+                              sttm_template_text: str = "",
+                              raw_vault_sql: str = "",
+                              source_metadata_summary: str = "",
+                              source_to_stage_text: str = ""):
+    """
+    Build the Forward STTM prompt — Phase 2 STTM that shows END-TO-END
+    column lineage from raw Source through the Raw Vault to the Business
+    Vault / Semantic layer.
+
+    Each output row represents ONE end-to-end column journey:
+
+        Source System.Source Table.Source Column
+            -> Stage Table.Stage Column
+            -> Raw Vault Table.Raw Vault Column
+            -> Business Vault / Semantic Table.Target Column
+
+    Parameters
+    ----------
+    bv_narrative_md
+        Business Vault narrative (target side).
+    reverse_summary
+        Reverse-engineering / Raw Vault summary.
+    dashboard_type
+        Dashboard type for context.
+    sttm_template_text
+        Optional user-supplied template — if present its header wins.
+    raw_vault_sql
+        Optional Raw Vault DDL — gives the model exact RV table /
+        column names to bridge to.
+    source_metadata_summary
+        Optional source metadata so the model knows the original source
+        tables / columns to anchor each row at.
+    source_to_stage_text
+        Optional Source → Stage CSV (from Phase-1 STTM) so the model
+        can carry stage-table names verbatim instead of re-inferring.
+    """
     # Optional user-supplied template wins over the default header.
     tmpl_header = ""
     tmpl_samples = ""
@@ -354,33 +388,64 @@ def build_forward_sttm_prompt(bv_narrative_md, reverse_summary,
             "the template header.\n"
         )
     else:
+        # Default end-to-end header: Source → Raw Vault → Business Vault
         header_block = (
             "HEADER:\n"
-            '"Source Layer","Source Table","Source Column","Target Layer",'
-            '"Target Table","Target Column","Target Data Type",'
-            '"Transform Kind","Transform Logic","Grain Notes",'
-            '"Business Rule"\n'
+            '"Source System","Source Table","Source Column",'
+            '"Source Data Type","Stage Table","Stage Column",'
+            '"Raw Vault Layer","Raw Vault Table","Raw Vault Column",'
+            '"Raw Vault Data Type","Business Vault Layer",'
+            '"Business Vault Table","Business Vault Column",'
+            '"Business Vault Data Type","Transform Kind",'
+            '"Transform Logic","Grain Notes","Business Rule"\n'
         )
 
-    return f"""You are a data mapping specialist. Output ONLY machine-
-parseable CSV.
+    # Optional input blocks. Truncate generously — the model needs every
+    # link in the chain to produce credible end-to-end rows.
+    src_blob = (source_metadata_summary or "")[:8000]
+    rv_sql_blob = (raw_vault_sql or "")[:10000]
+    s2s_blob = (source_to_stage_text or "")[:6000]
 
-TASK: Build Source-to-Target Mapping from Raw Vault (source) to
-Business Vault + Semantic Model (target) for a {dashboard_type} use
-case. Produce ONE ROW PER TARGET COLUMN.
+    return f"""You are a data mapping specialist building an END-TO-END
+Source-to-Target Mapping. Output ONLY machine-parseable CSV.
 
-BUSINESS VAULT / SEMANTIC MODEL (target):
+TASK: Build a Source-to-Target Mapping that walks every column from
+the original raw source SYSTEM all the way to the Business Vault /
+Semantic layer for a {dashboard_type} use case. ONE ROW PER target
+column, but each row MUST also identify the source column and the Raw
+Vault column it traces through. Targets that are pure Business Vault
+derivations (PIT / Bridge / computed metrics) may leave the source
+columns blank ("") — but the Raw Vault columns they read from MUST
+still be filled in.
+
+SOURCE SYSTEM METADATA (origin of every column):
+{src_blob if src_blob else "(none provided)"}
+
+SOURCE → STAGE CSV (from Phase-1 STTM — use these stage names verbatim):
+{s2s_blob if s2s_blob else "(none provided)"}
+
+RAW VAULT DDL / SUMMARY (intermediate layer):
+{rv_sql_blob if rv_sql_blob else reverse_summary[:8000]}
+
+BUSINESS VAULT / SEMANTIC MODEL (final target):
 {bv_narrative_md[:10000]}
 
-RAW VAULT (source):
-{reverse_summary[:8000]}
-
 OUTPUT FORMAT:
-1. Output ONLY CSV. No fences, no Markdown.
-2. First line the EXACT header below.
+1. Output ONLY CSV. No fences, no Markdown, no prose.
+2. First line is the EXACT header below.
 3. Quote every cell. Escape internal quotes as "".
-4. Target Layer in {{BusinessVault, SemanticFact, SemanticDim}}.
-5. Transform Kind in {{DirectCopy, Lookup, PIT, Bridge, Computed, Aggregate}}.
+4. Raw Vault Layer in {{Hub, Link, Satellite, "" }}.
+5. Business Vault Layer in {{BusinessVault, SemanticFact, SemanticDim,
+   PIT, Bridge}}.
+6. Transform Kind in {{DirectCopy, Lookup, PIT, Bridge, Computed,
+   Aggregate}}.
+7. Trace EVERY Business Vault / Semantic column back through the Raw
+   Vault to its underlying source column(s). When multiple source
+   columns feed one target, emit ONE ROW PER source column so the
+   lineage is fully expanded.
+8. Use exact table / column names from the Raw Vault DDL — do not
+   invent names. If the DDL is empty, fall back to the reverse
+   summary.
 
 {header_block}
 
@@ -2143,22 +2208,26 @@ def build_sttm_prompt(metadata_summary: str,
         )
 
     # ── Mode 1: source → staging, NO Raw Vault concepts at all ──────────
+    # In pre_raw_vault mode the STTM is split into TWO sections:
+    #   1. SOURCE → STAGE  : how raw source columns land in the staging
+    #                        layer (STG_*). 1-to-1 column passthrough
+    #                        with light type harmonization.
+    #   2. STAGE → TARGET  : how staging columns roll up into the
+    #                        proposed target layer (a clean conformed
+    #                        target table per business entity, e.g.
+    #                        TGT_CUSTOMER). This is where joins,
+    #                        deduplication, and harmonization live.
+    # The two sections are concatenated into ONE response, separated by
+    # a section marker line so the downstream parser can split them.
+    # Each section is its own CSV block with its own header.
     if pre_raw_vault:
-        default_header = (
-            '"Source System","Source Table","Source Column","Source Data Type",'
-            '"Target Table","Target Column","Target Data Type","Transformation",'
-            '"Business Key","PII Flag","Notes"'
-        )
-        default_example = (
-            'EXAMPLE — same CUSTOMER_ID from two different jobs, mapped to staging:\n'
-            '"DataStage-JobA","CUSTOMER_FEED","CUSTOMER_ID","VARCHAR(20)",'
-            '"STG_CUSTOMER_FEED","CUSTOMER_ID","VARCHAR(20)",'
-            '"UPPER(TRIM(CUSTOMER_ID))","Y","N","Source primary key"\n'
-            '"DataStage-JobB","LOAN_APPLICATIONS","CUSTOMER_ID","VARCHAR(20)",'
-            '"STG_LOAN_APPLICATIONS","CUSTOMER_ID","VARCHAR(20)",'
-            '"passthrough","Y","N","Foreign key into CUSTOMER_FEED"'
-        )
-        return f"""You are a data mapping specialist. Output must be
+        # If a user template was supplied, fall back to a single-section
+        # CSV (the template wins). The two-section split only applies to
+        # the built-in default schema.
+        if tmpl_header:
+            default_header = tmpl_header
+            default_example = ""
+            return f"""You are a data mapping specialist. Output must be
 machine-parseable CSV — not prose, not Markdown.
 
 TASK: Build a Source-to-Target Mapping (STTM) from this source metadata
@@ -2171,35 +2240,11 @@ STRICT RULES — these override anything else you may have been trained on:
    "HK", "HASHDIFF", "LOAD_DTS", "REC_SRC", or any vault-modeling
    terminology in any cell. This STTM is produced BEFORE the vault
    model is designed — vault concepts are out of scope.
-2. Target tables MUST be named ``STG_<SOURCE_ENTITY>`` (uppercase, with
-   non-alphanumeric characters replaced by underscore).
-3. Target columns MUST mirror the source column names verbatim, with
-   one row per source column. No renaming, no prefixing.
-4. Target data types should be Snowflake-friendly equivalents of the
-   source types (VARCHAR, NUMBER, TIMESTAMP_NTZ, DATE, BOOLEAN, etc.).
-5. The "Transformation" column captures the legacy logic that produces
-   each column (UPPER, TRIM, CAST, CASE, lookup, etc.) — copy verbatim
-   from the source where possible. Use "passthrough" if the value is
-   moved as-is. Never write "Hub key" / "Sat attribute" — those are
-   vault concepts.
-6. "Business Key" flag (Y/N) marks columns that uniquely identify a
-   business entity in the source — that's a SOURCE observation, not a
-   vault decision.
-7. "PII Flag" (Y/N) flags personally-identifiable columns (name, email,
-   SSN, phone, address, etc.).
-8. Every source column from every entity in every file MUST appear as a
+2. Every source column from every entity in every file MUST appear as a
    row.
 
 SOURCE METADATA:
 {metadata_summary}
-
-CRITICAL RULES FOR THE "Source Data Type" COLUMN:
-- Every source entity in the COMPLETE ENTITY INVENTORY lists columns
-  in the form ``COLUMN_NAME TYPE`` (e.g. ``CUSTOMER_ID VARCHAR(20)``).
-- Copy the type VERBATIM into the "Source Data Type" cell.
-- If a column is listed without a type (bare name), write "VARCHAR" as
-  a safe default AND add "(type unknown in source metadata)" to Notes.
-- NEVER write "Unknown" in the Source Data Type cell.
 
 OUTPUT FORMAT:
 1. Output ONLY CSV. No prose, no fences, no headings, no Markdown.
@@ -2210,6 +2255,129 @@ OUTPUT FORMAT:
 {_template_block(default_header, default_example)}
 
 Begin now. Your response must start with the character `"`.
+"""
+
+        # Default two-section schema
+        s2s_header = (
+            '"Source System","Source Table","Source Column","Source Data Type",'
+            '"Stage Table","Stage Column","Stage Data Type","Transformation",'
+            '"Business Key","PII Flag","Notes"'
+        )
+        s2t_header = (
+            '"Stage Table","Stage Column","Stage Data Type",'
+            '"Target Table","Target Column","Target Data Type",'
+            '"Transformation","Join / Lookup","Grain Notes",'
+            '"Business Key","PII Flag","Notes"'
+        )
+
+        s2s_example = (
+            'EXAMPLE — Source → Stage:\n'
+            '"DataStage-JobA","CUSTOMER_FEED","CUSTOMER_ID","VARCHAR(20)",'
+            '"STG_CUSTOMER_FEED","CUSTOMER_ID","VARCHAR(20)",'
+            '"UPPER(TRIM(CUSTOMER_ID))","Y","N","Source primary key"'
+        )
+        s2t_example = (
+            'EXAMPLE — Stage → Target:\n'
+            '"STG_CUSTOMER_FEED","CUSTOMER_ID","VARCHAR(20)",'
+            '"TGT_CUSTOMER","CUSTOMER_ID","VARCHAR(20)",'
+            '"passthrough","none","one row per customer",'
+            '"Y","N","Conformed customer master"'
+        )
+
+        return f"""You are a data mapping specialist. Output must be
+machine-parseable CSV — not prose, not Markdown.
+
+TASK: Build a TWO-SECTION Source-to-Target Mapping (STTM) from this
+source metadata (which may span MULTIPLE jobs / files / tech stacks).
+
+The mapping is split into TWO layers:
+
+  • SECTION 1 — SOURCE → STAGE
+      How raw source columns land in the staging layer (STG_*).
+      One row per source column. Targets here are STAGING tables that
+      mirror the source structure (one staging table per distinct
+      source entity).
+
+  • SECTION 2 — STAGE → TARGET
+      How staging columns roll up into the proposed conformed target
+      layer (TGT_*). One row per target column. Joins, deduplication,
+      and business-friendly harmonization happen here.
+
+STRICT RULES — these override anything else you may have been trained on:
+1. DO NOT mention "Raw Vault", "Data Vault", "Hub", "Link", "Satellite",
+   "HK", "HASHDIFF", "LOAD_DTS", "REC_SRC", or any vault-modeling
+   terminology in any cell. This STTM is produced BEFORE the vault
+   model is designed — vault concepts are out of scope.
+2. Stage tables MUST be named ``STG_<SOURCE_ENTITY>`` (uppercase, with
+   non-alphanumeric characters replaced by underscore). Stage columns
+   MUST mirror the source column names verbatim, one row per source
+   column.
+3. Target tables MUST be named ``TGT_<BUSINESS_ENTITY>`` (uppercase).
+   Multiple stage tables may feed one target table when they describe
+   the same business entity (e.g. CUSTOMER_FEED + CUSTOMER_ADDR_FEED
+   both feed TGT_CUSTOMER).
+4. Stage / Target data types should be Snowflake-friendly equivalents
+   of the source types (VARCHAR, NUMBER, TIMESTAMP_NTZ, DATE, BOOLEAN,
+   etc.).
+5. The "Transformation" column captures the logic that produces each
+   column (UPPER, TRIM, CAST, CASE, lookup, etc.) — copy verbatim from
+   the source where possible. Use "passthrough" if the value moves
+   as-is.
+6. "Business Key" (Y/N) marks columns that uniquely identify a business
+   entity. "PII Flag" (Y/N) flags personally-identifiable columns
+   (name, email, SSN, phone, address, etc.).
+7. SECTION 1 — every source column from every entity MUST appear.
+   SECTION 2 — every stage column with a corresponding target column
+   MUST appear; columns dropped at the target layer can be omitted.
+
+SOURCE METADATA:
+{metadata_summary}
+
+CRITICAL RULES FOR THE "Source Data Type" COLUMN:
+- Every source entity in the COMPLETE ENTITY INVENTORY lists columns
+  in the form ``COLUMN_NAME TYPE`` (e.g. ``CUSTOMER_ID VARCHAR(20)``).
+- Copy the type VERBATIM into the "Source Data Type" cell.
+- If a column is listed without a type, write "VARCHAR" as a safe
+  default AND add "(type unknown in source metadata)" to Notes.
+- NEVER write "Unknown" in the Source Data Type cell.
+
+OUTPUT FORMAT — CRITICAL, follow EXACTLY:
+
+The response MUST contain TWO CSV sections separated by a marker line.
+Use this EXACT marker (a comment line that is NOT a CSV row):
+
+    # === SECTION: STAGE_TO_TARGET ===
+
+The shape is:
+
+    # === SECTION: SOURCE_TO_STAGE ===
+    {s2s_header}
+    "...","...",...
+    "...","...",...
+
+    # === SECTION: STAGE_TO_TARGET ===
+    {s2t_header}
+    "...","...",...
+    "...","...",...
+
+Rules:
+1. Start the response with the line `# === SECTION: SOURCE_TO_STAGE ===`
+   followed by the SECTION-1 header on the next line.
+2. After the SECTION-1 rows, emit a blank line then the marker
+   `# === SECTION: STAGE_TO_TARGET ===` on its own line, then the
+   SECTION-2 header on the next line, then the SECTION-2 rows.
+3. Inside each section: quote every cell with double quotes. Escape
+   internal quotes as "". No newlines inside cells. No prose, no
+   Markdown fences, no headings other than the two marker lines.
+4. SECTION-1 header MUST be EXACTLY: {s2s_header}
+5. SECTION-2 header MUST be EXACTLY: {s2t_header}
+
+{s2s_example}
+
+{s2t_example}
+
+Begin now. Your response must start with the line
+`# === SECTION: SOURCE_TO_STAGE ===`.
 """
 
     # ── Modes 2 & 3: legacy Data-Vault-aware STTM ──────────────────────
@@ -2960,6 +3128,17 @@ SCORECARD — these weights are FIXED. Use them verbatim.
   Hash Standardization   :  5%
   Data Quality Readiness : 10%
 
+PER-TABLE SCORECARD — score EVERY artifact (every Hub, Link, and
+Satellite) listed in the Raw Vault DDL. Each per-table row reports a
+short overall score plus a per-dimension breakdown so reviewers can
+triage at the table level. Dimensions that don't apply to the object
+type may be 0 (e.g. ``satellite_design_score`` is 0 for Hubs / Links;
+``relationship_score`` is most meaningful for Links). The
+``readiness_level`` for each table follows the same bands as the
+overall readiness level. ``issues_count`` is the count of violations
+in the Rule Violations Register that name this table; ``high_severity``
+is the count of those that are severity ``High``.
+
 Readiness levels:
   90–100: Production Ready
   75–89 : Minor Refinements Required
@@ -3084,13 +3263,32 @@ applies):
       "area":     "Structural|Business Key|Lineage|Hash|...",
       "action":   "1-2 sentence specific action item"}}
   ],
+  "table_scorecards": [
+    {{
+      "table":            "HUB_CUSTOMER",
+      "object_type":      "Hub|Link|Satellite",
+      "overall_score":    92,
+      "readiness_level":  "Production Ready|Minor Refinements Required|Significant Review Required|Re-modeling Recommended",
+      "structural_score":      95,
+      "business_key_score":    90,
+      "relationship_score":    88,
+      "satellite_design_score": 0,
+      "lineage_score":         95,
+      "hash_score":            100,
+      "data_quality_score":    85,
+      "issues_count":     1,
+      "high_severity":    0,
+      "summary":          "1-sentence per-table assessment"
+    }}
+  ],
   "deliverables_checklist": {{
     "validation_report":              true,
     "rule_violations_register":       true,
     "business_key_confidence_matrix": true,
     "lineage_completeness_matrix":    true,
     "remediation_recommendations":    true,
-    "production_readiness_scorecard": true
+    "production_readiness_scorecard": true,
+    "per_table_scorecard":            true
   }}
 }}
 

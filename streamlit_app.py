@@ -100,6 +100,8 @@ from nexus.dbt_sanitizers import (
     NATIVE_DBT_PROFILE_ROLE, NATIVE_DBT_PROFILE_WAREHOUSE,
     RAW_SOURCE_SCHEMA, RAW_VAULT_SCHEMA, BUSINESS_VAULT_SCHEMA,
     SNOWFLAKE_NATIVE_DBT_VERSION,
+    VECTORS_REVERSE_ENG, VECTORS_FORWARD_ENG, VECTORS_RESULTS,
+    APP_RUN_REGISTRY, PHASE_TABLE_DIM,
     _SCAFFOLD_PACKAGES_YML, _SCAFFOLD_DBT_PROJECT_RV,
     _SCAFFOLD_DBT_PROJECT_BV, _RECORD_SOURCE_MACRO,
     _SCAFFOLD_PROFILES_YML,
@@ -554,6 +556,117 @@ def build_artifacts_bundle(artifacts: dict,
                     zf.writestr(p, raw)
                     entry["files"].append(p)
 
+            elif kind == "sttm_split":
+                # Two-section STTM (Source→Stage + Stage→Target) plus
+                # raw-source DDL and dummy-data INSERTs. Each piece
+                # gets its own file in the zip.
+                s2s_df  = content.get("s2s_df")
+                s2t_df  = content.get("s2t_df")
+                comb_df = content.get("combined_df")
+                src_ddl = content.get("source_ddl") or ""
+                src_dml = content.get("source_dml") or ""
+                src_summary_df = content.get("source_summary")
+                raw = content.get("raw", "") or ""
+
+                if s2s_df is not None and not s2s_df.empty:
+                    p = f"{folder}/source_to_stage.csv"
+                    zf.writestr(p, s2s_df.to_csv(index=False))
+                    entry["files"].append(p)
+                    try:
+                        xb = df_to_excel_bytes(
+                            s2s_df, sheet_name="Source_to_Stage",
+                        )
+                        p = f"{folder}/source_to_stage.xlsx"
+                        zf.writestr(p, xb)
+                        entry["files"].append(p)
+                    except Exception:
+                        pass
+                if s2t_df is not None and not s2t_df.empty:
+                    p = f"{folder}/stage_to_target.csv"
+                    zf.writestr(p, s2t_df.to_csv(index=False))
+                    entry["files"].append(p)
+                    try:
+                        xb = df_to_excel_bytes(
+                            s2t_df, sheet_name="Stage_to_Target",
+                        )
+                        p = f"{folder}/stage_to_target.xlsx"
+                        zf.writestr(p, xb)
+                        entry["files"].append(p)
+                    except Exception:
+                        pass
+                # Combined workbook with both sheets.
+                if (s2s_df is not None and not s2s_df.empty) or \
+                   (s2t_df is not None and not s2t_df.empty):
+                    try:
+                        from io import BytesIO as _zsb
+                        zbuf = _zsb()
+                        with pd.ExcelWriter(
+                            zbuf, engine="openpyxl",
+                        ) as xw:
+                            if s2s_df is not None and not s2s_df.empty:
+                                s2s_df.to_excel(
+                                    xw, sheet_name="Source_to_Stage",
+                                    index=False,
+                                )
+                            if s2t_df is not None and not s2t_df.empty:
+                                s2t_df.to_excel(
+                                    xw, sheet_name="Stage_to_Target",
+                                    index=False,
+                                )
+                        p = f"{folder}/{_slug(key)}_combined.xlsx"
+                        zf.writestr(p, zbuf.getvalue())
+                        entry["files"].append(p)
+                    except Exception:
+                        pass
+                # Single-section fallback (user-template path).
+                if comb_df is not None and not comb_df.empty:
+                    p = f"{folder}/{_slug(key)}.csv"
+                    zf.writestr(p, comb_df.to_csv(index=False))
+                    entry["files"].append(p)
+                    try:
+                        xb = df_to_excel_bytes(
+                            comb_df, sheet_name=label[:31],
+                        )
+                        p = f"{folder}/{_slug(key)}.xlsx"
+                        zf.writestr(p, xb)
+                        entry["files"].append(p)
+                    except Exception:
+                        pass
+                # Raw source DDL + dummy data
+                if src_ddl.strip():
+                    p = f"{folder}/raw_source_ddl.sql"
+                    zf.writestr(p, src_ddl)
+                    entry["files"].append(p)
+                if src_dml.strip():
+                    p = f"{folder}/raw_source_dummy_data.sql"
+                    zf.writestr(p, src_dml)
+                    entry["files"].append(p)
+                # Source-table summary
+                if src_summary_df is not None and \
+                        not src_summary_df.empty:
+                    p = f"{folder}/raw_source_tables.csv"
+                    zf.writestr(p, src_summary_df.to_csv(index=False))
+                    entry["files"].append(p)
+                # Combined setup script
+                if src_ddl.strip() or src_dml.strip():
+                    combo = (
+                        "-- =====================================\n"
+                        "-- Raw source DDL\n"
+                        "-- =====================================\n"
+                        f"{src_ddl}\n\n"
+                        "-- =====================================\n"
+                        "-- Dummy data\n"
+                        "-- =====================================\n"
+                        f"{src_dml}\n"
+                    )
+                    p = f"{folder}/raw_source_setup.sql"
+                    zf.writestr(p, combo)
+                    entry["files"].append(p)
+                if raw:
+                    p = f"{folder}/_raw_response.txt"
+                    zf.writestr(p, raw)
+                    entry["files"].append(p)
+
             elif kind == "lineage":
                 mer = content.get("mermaid") or ""
                 s2h_df = content.get("source_to_hub")
@@ -794,26 +907,69 @@ def _fqn(table: str) -> str:
     return f"{VECTOR_DB}.{VECTOR_SCHEMA}.{table}"
 
 
+# ── Phase routing ─────────────────────────────────────────────────────────────
+# Artifact types that belong to the Reverse Engineering phase.  Everything
+# else is Forward Engineering unless it explicitly appears in _RESULTS_TYPES.
+_REVERSE_ENG_TYPES: set = {
+    "Data Lineage — Source-to-Hub",
+    "Data Lineage — Graph Node",
+    "STTM",
+    "Data Catalog",
+    "Data Domain",
+    "Transformation Rules",
+    "Raw Vault Model — Narrative",
+    "Raw Vault Model — DDL",
+    "Raw Vault Model — ER Diagram",
+    "Raw Vault Validation",
+}
+
+_RESULTS_TYPES: set = {
+    "Generated SQL",
+    "Generated dbt Model",
+    "Generated dbt Macro",
+    "Generated dbt Test",
+    "Generated dbt YAML",
+    "Execution Log",
+    "Codegen Summary",
+}
+
+# Human-readable phase labels used in the UI.
+PHASE_LABELS = {
+    VECTORS_REVERSE_ENG: "Reverse Engineering",
+    VECTORS_FORWARD_ENG: "Forward Engineering",
+    VECTORS_RESULTS:     "Results",
+}
+
+
+def _route_chunk_to_table(artifact_type: str) -> str:
+    """Return the target phase table name for a given artifact_type string."""
+    if artifact_type in _REVERSE_ENG_TYPES:
+        return VECTORS_REVERSE_ENG
+    if artifact_type in _RESULTS_TYPES:
+        return VECTORS_RESULTS
+    # Forward Engineering is the default (Business Vault, dbt files, etc.)
+    return VECTORS_FORWARD_ENG
+
+
 def ensure_vector_infrastructure(session):
     """
-    Create the database, schema, stage, and vector tables if they don't
-    exist. Idempotent. Called once per persist / vectorization run.
+    Create the database, schema, stage, three phase-specific vector tables,
+    and the APP_RUN_REGISTRY if they don't exist.  Idempotent.
 
-    The fix here addresses the most common cause of "artifacts are not
-    getting stored in stage" — the schema or database not existing in
-    the target account. We CREATE IF NOT EXISTS at every level (DB →
-    schema → stage → tables) and surface a clear error if any step
-    fails so the user can see which permission they're missing.
+    Phase tables (all 1024-dimensional):
+      VECTORS_REVERSE_ENG  — parsed source-system artifacts
+      VECTORS_FORWARD_ENG  — generated design / dbt artifacts
+      VECTORS_RESULTS      — final generated outputs per run
+
+    APP_RUN_REGISTRY tracks per-phase embedding status so re-running the
+    same (application_name, version) skips already-embedded phases.
     """
-    # 1. Database — CREATE IF NOT EXISTS. If the role lacks CREATE
-    #    DATABASE, fall back to USE DATABASE to confirm it's reachable.
+    # 1. Database
     try:
         session.sql(
             f"CREATE DATABASE IF NOT EXISTS {VECTOR_DB}"
         ).collect()
     except Exception as e_db:
-        # The role may not have CREATE DATABASE privilege but the DB
-        # might already exist — try to USE it before giving up.
         try:
             session.sql(f"USE DATABASE {VECTOR_DB}").collect()
         except Exception as e_use:
@@ -824,7 +980,7 @@ def ensure_vector_infrastructure(session):
                 f"your current role, or to create the database for you."
             )
 
-    # 2. Schema — CREATE IF NOT EXISTS, fully qualified.
+    # 2. Schema
     try:
         session.sql(
             f"CREATE SCHEMA IF NOT EXISTS {VECTOR_DB}.{VECTOR_SCHEMA}"
@@ -842,9 +998,7 @@ def ensure_vector_infrastructure(session):
                 f"on this schema to your current role."
             )
 
-    # 3. Stage — must be CREATEd in the target schema. The fully-
-    #    qualified name handles cases where the session's default
-    #    schema differs.
+    # 3. Stage
     try:
         session.sql(
             f"CREATE STAGE IF NOT EXISTS {_fqn(VECTOR_STAGE)} "
@@ -858,37 +1012,121 @@ def ensure_vector_infrastructure(session):
             f"{VECTOR_DB}.{VECTOR_SCHEMA} to your current role."
         )
 
-    # 4. Vector tables — same idempotent pattern.
-    for _, (_, dim, table) in EMBED_MODELS.items():
-        ddl = (
-            f"CREATE TABLE IF NOT EXISTS {_fqn(table)} ("
-            f"  ROW_ID STRING NOT NULL,"
-            f"  VERSION STRING NOT NULL,"
-            f"  DATA_DOMAIN STRING NOT NULL,"
-            f"  ARTIFACT_TYPE STRING NOT NULL,"
-            f"  ARTIFACT_LABEL STRING,"
-            f"  CHUNK_ID STRING NOT NULL,"
-            f"  ENTITY STRING,"
-            f"  CONTENT STRING NOT NULL,"
-            f"  METADATA VARIANT,"
-            f"  EMBEDDING_MODEL STRING NOT NULL,"
-            f"  EMBEDDING VECTOR(FLOAT, {dim}) NOT NULL,"
-            f"  CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),"
-            f"  CONSTRAINT PK_{table} PRIMARY KEY (ROW_ID)"
-            f") "
-            f"COMMENT = 'Vector store for Data Engineering Co-Pilot - "
-            f"dimension {dim}'"
-        )
+    # 4. Three phase-specific vector tables (all 1024d).
+    #    CLUSTER BY is applied as a separate ALTER TABLE so that CREATE TABLE
+    #    succeeds even on Snowflake Standard edition (which silently rejects
+    #    CLUSTER BY inside CREATE TABLE on accounts without Automatic Clustering).
+    _phase_table_ddls = {
+        VECTORS_REVERSE_ENG: (
+            f"CREATE TABLE IF NOT EXISTS {_fqn(VECTORS_REVERSE_ENG)} ("
+            f"  CHUNK_ID          STRING  NOT NULL,"
+            f"  APPLICATION_NAME  STRING  NOT NULL,"
+            f"  VERSION           STRING  NOT NULL,"
+            f"  DATA_DOMAIN       STRING  NOT NULL,"
+            f"  ARTIFACT_TYPE     STRING  NOT NULL,"
+            f"  ARTIFACT_LABEL    STRING,"
+            f"  ENTITY            STRING,"
+            f"  SOURCE_SYSTEM     STRING,"
+            f"  CONTENT           STRING  NOT NULL,"
+            f"  METADATA          VARIANT,"
+            f"  EMBEDDING_MODEL   STRING  NOT NULL,"
+            f"  EMBEDDING         VECTOR(FLOAT, {PHASE_TABLE_DIM}) NOT NULL,"
+            f"  EMBEDDED_AT       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),"
+            f"  CONSTRAINT PK_VRE PRIMARY KEY (CHUNK_ID, APPLICATION_NAME, VERSION)"
+            f") COMMENT = 'Reverse Engineering phase vectors'"
+        ),
+        VECTORS_FORWARD_ENG: (
+            f"CREATE TABLE IF NOT EXISTS {_fqn(VECTORS_FORWARD_ENG)} ("
+            f"  CHUNK_ID          STRING  NOT NULL,"
+            f"  APPLICATION_NAME  STRING  NOT NULL,"
+            f"  VERSION           STRING  NOT NULL,"
+            f"  DATA_DOMAIN       STRING  NOT NULL,"
+            f"  ARTIFACT_TYPE     STRING  NOT NULL,"
+            f"  ARTIFACT_LABEL    STRING,"
+            f"  ENTITY            STRING,"
+            f"  FILE_PATH         STRING,"
+            f"  DBT_LAYER         STRING,"
+            f"  FILE_CATEGORY     STRING,"
+            f"  CONTENT           STRING  NOT NULL,"
+            f"  METADATA          VARIANT,"
+            f"  EMBEDDING_MODEL   STRING  NOT NULL,"
+            f"  EMBEDDING         VECTOR(FLOAT, {PHASE_TABLE_DIM}) NOT NULL,"
+            f"  EMBEDDED_AT       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),"
+            f"  CONSTRAINT PK_VFE PRIMARY KEY (CHUNK_ID, APPLICATION_NAME, VERSION)"
+            f") COMMENT = 'Forward Engineering phase vectors'"
+        ),
+        VECTORS_RESULTS: (
+            f"CREATE TABLE IF NOT EXISTS {_fqn(VECTORS_RESULTS)} ("
+            f"  CHUNK_ID          STRING  NOT NULL,"
+            f"  APPLICATION_NAME  STRING  NOT NULL,"
+            f"  VERSION           STRING  NOT NULL,"
+            f"  RESULT_TYPE       STRING  NOT NULL,"
+            f"  DATA_DOMAIN       STRING,"
+            f"  ENTITY            STRING,"
+            f"  FILE_PATH         STRING,"
+            f"  RUN_STATUS        STRING  DEFAULT 'SUCCESS',"
+            f"  GENERATED_BY      STRING,"
+            f"  CONTENT           STRING  NOT NULL,"
+            f"  METADATA          VARIANT,"
+            f"  EMBEDDING_MODEL   STRING  NOT NULL,"
+            f"  EMBEDDING         VECTOR(FLOAT, {PHASE_TABLE_DIM}) NOT NULL,"
+            f"  EMBEDDED_AT       TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),"
+            f"  CONSTRAINT PK_VRS PRIMARY KEY (CHUNK_ID, APPLICATION_NAME, VERSION)"
+            f") COMMENT = 'Results phase vectors'"
+        ),
+    }
+
+    # Clustering keys applied separately so a missing Automatic Clustering
+    # feature doesn't block table creation.
+    _cluster_keys = {
+        VECTORS_REVERSE_ENG: "(APPLICATION_NAME, VERSION, DATA_DOMAIN)",
+        VECTORS_FORWARD_ENG: "(APPLICATION_NAME, VERSION, DBT_LAYER, FILE_CATEGORY)",
+        VECTORS_RESULTS:     "(APPLICATION_NAME, VERSION, RESULT_TYPE)",
+    }
+
+    _tbl_errors = []
+    for tbl, ddl in _phase_table_ddls.items():
         try:
             session.sql(ddl).collect()
         except Exception as e_tbl:
-            # Vector tables are optional for the staging path — don't
-            # block stage upload over a vector-table failure. Surface
-            # via a runtime warning the caller can show.
-            import warnings
-            warnings.warn(
-                f"Could not create vector table {_fqn(table)}: {e_tbl}"
-            )
+            _tbl_errors.append(f"{tbl}: {e_tbl}")
+            continue
+        # Best-effort clustering — ignore failure on Standard edition
+        try:
+            session.sql(
+                f"ALTER TABLE {_fqn(tbl)} "
+                f"CLUSTER BY {_cluster_keys[tbl]}"
+            ).collect()
+        except Exception:
+            pass
+
+    if _tbl_errors:
+        import streamlit as _st
+        _st.warning(
+            "Some vector tables could not be created — check role permissions:\n"
+            + "\n".join(_tbl_errors)
+        )
+
+    # 5. APP_RUN_REGISTRY — lightweight per-phase status tracker.
+    try:
+        session.sql(
+            f"CREATE TABLE IF NOT EXISTS {_fqn(APP_RUN_REGISTRY)} ("
+            f"  APPLICATION_NAME      STRING  NOT NULL,"
+            f"  VERSION               STRING  NOT NULL,"
+            f"  REVERSE_ENG_STATUS    STRING  DEFAULT 'PENDING',"
+            f"  REVERSE_ENG_CHUNKS    INT     DEFAULT 0,"
+            f"  FORWARD_ENG_STATUS    STRING  DEFAULT 'PENDING',"
+            f"  FORWARD_ENG_CHUNKS    INT     DEFAULT 0,"
+            f"  RESULTS_STATUS        STRING  DEFAULT 'PENDING',"
+            f"  RESULTS_CHUNKS        INT     DEFAULT 0,"
+            f"  CREATED_AT            TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),"
+            f"  LAST_UPDATED          TIMESTAMP_NTZ,"
+            f"  CONSTRAINT PK_ARR PRIMARY KEY (APPLICATION_NAME, VERSION)"
+            f") COMMENT = 'Per-phase embedding status'"
+        ).collect()
+    except Exception as e_reg:
+        import streamlit as _st
+        _st.warning(f"Could not create {APP_RUN_REGISTRY}: {e_reg}")
 
 
 def extract_domain_map(artifacts: dict) -> dict:
@@ -989,18 +1227,24 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
     Turn every artifact into a list of chunks suitable for embedding.
     Each chunk is:
         {
-          "artifact_type": str,  # key in artifacts dict
+          "artifact_type":  str,   # drives phase-table routing
           "artifact_label": str,
-          "chunk_id": str,       # unique within (artifact_type, version)
-          "entity": str,         # for domain resolution & filtering
-          "data_domain": str,    # resolved via domain_map
-          "content": str,        # the text to embed
-          "metadata": dict,      # free-form, stored as VARIANT
+          "chunk_id":       str,   # human-readable; SHA2 computed at insert time
+          "entity":         str,   # for domain resolution & filtering
+          "data_domain":    str,   # resolved via domain_map
+          "content":        str,   # the text to embed
+          "metadata":       dict,  # stored as VARIANT
+          # Phase-specific extras (None when not applicable):
+          "source_system":  str,   # RE only — DataStage / SSIS / etc.
+          "file_path":      str,   # FE dbt files — relative path in project
+          "dbt_layer":      str,   # FE — 'raw_vault' | 'business_vault'
+          "file_category":  str,   # FE — 'models' | 'macros' | 'tests' | ...
         }
     Chunking strategy varies by artifact kind:
-      table  → one chunk per row
+      table     → one chunk per row
       raw_vault → narrative by section, DDL by CREATE TABLE
-      lineage → one chunk per source-to-hub mapping + per Mermaid entity
+      lineage   → one chunk per source-to-hub mapping + per Mermaid entity
+      dbt_project → one chunk per file
     """
     chunks = []
 
@@ -1008,6 +1252,13 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
         kind    = art.get("kind", "")
         label   = art.get("label", key)
         content = art.get("content", {}) or {}
+
+        # Infer dbt_layer from key for raw_vault artifacts in FE phase
+        _dbt_layer = None
+        if "Business Vault" in key or "business_vault" in key.lower():
+            _dbt_layer = "business_vault"
+        elif "Raw Vault" in key or "raw_vault" in key.lower():
+            _dbt_layer = "raw_vault"
 
         if kind == "raw_vault":
             # Narrative → one chunk per section heading
@@ -1022,13 +1273,15 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "entity":         heading,
                     "data_domain":    _resolve_domain([heading], domain_map),
                     "content":        body,
-                    "metadata":       {"section": heading,
-                                       "source": "narrative"},
+                    "metadata":       {"section": heading, "source": "narrative"},
+                    "source_system":  None,
+                    "file_path":      None,
+                    "dbt_layer":      _dbt_layer,
+                    "file_category":  None,
                 })
             # DDL → one chunk per CREATE TABLE
             ddl = content.get("sql") or ""
             for i, stmt in enumerate(_split_ddl_by_create_table(ddl)):
-                # Extract table name from the statement
                 m = re.search(
                     r'CREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+'
                     r'(?:[A-Za-z_][\w]*\.)?([A-Za-z_][\w]*)',
@@ -1042,10 +1295,13 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "entity":         tname,
                     "data_domain":    _resolve_domain([tname], domain_map),
                     "content":        stmt,
-                    "metadata":       {"table_name": tname,
-                                       "source": "ddl"},
+                    "metadata":       {"table_name": tname, "source": "ddl"},
+                    "source_system":  None,
+                    "file_path":      None,
+                    "dbt_layer":      _dbt_layer,
+                    "file_category":  None,
                 })
-            # Mermaid → per-entity chunks (optional; indexing helps)
+            # Mermaid → per-entity chunks
             mermaid = content.get("mermaid") or ""
             for i, (entity, body) in enumerate(
                 _split_mermaid_entities(mermaid)
@@ -1057,21 +1313,22 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "entity":         entity,
                     "data_domain":    _resolve_domain([entity], domain_map),
                     "content":        body,
-                    "metadata":       {"entity": entity,
-                                       "source": "mermaid"},
+                    "metadata":       {"entity": entity, "source": "mermaid"},
+                    "source_system":  None,
+                    "file_path":      None,
+                    "dbt_layer":      _dbt_layer,
+                    "file_category":  None,
                 })
 
         elif kind == "table":
             df = content.get("df")
             if df is None or df.empty:
                 continue
-            # Try to find an entity column for domain resolution
             cols = {c.lower(): c for c in df.columns}
             ent_col = (cols.get("entity") or cols.get("entity_name")
                        or cols.get("source table") or cols.get("source_table")
                        or cols.get("target table") or cols.get("target_table"))
             for i, row in df.iterrows():
-                # Render the row as "col: val" lines — dense but readable
                 lines = []
                 for c in df.columns:
                     v = str(row[c]) if row[c] is not None else ""
@@ -1088,10 +1345,16 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "content":        content_text,
                     "metadata":       {"row_index": int(i),
                                        "columns": list(df.columns)},
+                    "source_system":  None,
+                    "file_path":      None,
+                    "dbt_layer":      None,
+                    "file_category":  None,
                 })
 
         elif kind == "lineage":
-            # Source-to-Hub mapping — one chunk per row
+            # Source system hint stored in artifact metadata if present
+            _src_sys = art.get("source_system") or None
+
             s2h_df = content.get("source_to_hub")
             if s2h_df is not None and not s2h_df.empty:
                 cols = {c.lower(): c for c in s2h_df.columns}
@@ -1110,15 +1373,16 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                         "artifact_label": label,
                         "chunk_id":       f"s2h_{i:05d}",
                         "entity":         src or hub,
-                        "data_domain":    _resolve_domain(
-                            [src, hub], domain_map
-                        ),
+                        "data_domain":    _resolve_domain([src, hub], domain_map),
                         "content":        "\n".join(lines),
                         "metadata":       {"source_entity": src,
                                            "hub": hub,
                                            "row_index": int(i)},
+                        "source_system":  _src_sys,
+                        "file_path":      None,
+                        "dbt_layer":      None,
+                        "file_category":  None,
                     })
-            # Graph nodes — one chunk per node
             graph = content.get("graph") or {}
             for n in graph.get("nodes", []):
                 label_text = str(n.get("label", ""))
@@ -1127,9 +1391,7 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "artifact_label": label,
                     "chunk_id":       f"node_{n['id']}",
                     "entity":         label_text,
-                    "data_domain":    _resolve_domain(
-                        [label_text], domain_map
-                    ),
+                    "data_domain":    _resolve_domain([label_text], domain_map),
                     "content":        (
                         f"Node: {label_text}\n"
                         f"Kind: {n.get('kind', '')}\n"
@@ -1138,21 +1400,27 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "metadata":       {"node_id": n["id"],
                                        "kind": n.get("kind", ""),
                                        "group": n.get("group", "")},
+                    "source_system":  _src_sys,
+                    "file_path":      None,
+                    "dbt_layer":      None,
+                    "file_category":  None,
                 })
 
         elif kind == "dbt_project":
-            # One chunk per file in the dbt project. Each file is self-
-            # contained (a model, macro, test, yml) so row-per-file is
-            # the right granularity for semantic search.
             files = content.get("files") or {}
+            # Infer dbt_layer from the artifact key
+            _dbt_layer_dbt = None
+            if "Business Vault" in key or "business_vault" in key.lower():
+                _dbt_layer_dbt = "business_vault"
+            elif "Raw Vault" in key or "raw_vault" in key.lower():
+                _dbt_layer_dbt = "raw_vault"
+
             for i, (rel_path, body) in enumerate(files.items()):
                 if not body or not str(body).strip():
                     continue
-                # Pull entity from filename: stg_customer.sql → stg_customer
                 base = rel_path.rsplit("/", 1)[-1]
                 entity = re.sub(r"\.(sql|yml|yaml|md)$", "", base,
                                 flags=re.IGNORECASE)
-                # Classify by directory for metadata
                 parts = rel_path.split("/")
                 category = "root"
                 for p in parts:
@@ -1160,8 +1428,6 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                              "snapshots", "analyses"):
                         category = p
                         break
-                # Truncate very long files — keep the first ~6KB which
-                # captures config + first several CTEs for most models.
                 body_str = str(body)
                 if len(body_str) > 6000:
                     body_str = body_str[:6000] + "\n-- [truncated] --"
@@ -1170,13 +1436,15 @@ def chunk_artifacts(artifacts: dict, domain_map: dict) -> list:
                     "artifact_label": label,
                     "chunk_id":       f"file_{i:04d}_{_slug(rel_path)}",
                     "entity":         entity,
-                    "data_domain":    _resolve_domain(
-                        [entity], domain_map
-                    ),
+                    "data_domain":    _resolve_domain([entity], domain_map),
                     "content":        f"# FILE: {rel_path}\n\n{body_str}",
                     "metadata":       {"file_path": rel_path,
                                        "category": category,
                                        "file_size": len(str(body))},
+                    "source_system":  None,
+                    "file_path":      rel_path,
+                    "dbt_layer":      _dbt_layer_dbt,
+                    "file_category":  category,
                 })
 
     return chunks
@@ -1731,143 +1999,386 @@ def publish_dbt_project_to_github(
 
 
 def embed_and_store(session, chunks: list, version: str,
-                    embed_model: str, dim: int, table: str,
-                    progress_cb=None) -> int:
+                    application_name: str,
+                    embed_model: str, dim: int,
+                    progress_cb=None) -> dict:
     """
-    Generate embeddings via Cortex and insert into the vector table.
-    Deletes any rows with this (version, embed_model) before insert so
-    re-running the pipeline is idempotent.
+    Generate embeddings via Cortex and insert into the three phase-specific
+    vector tables (VECTORS_REVERSE_ENG, VECTORS_FORWARD_ENG, VECTORS_RESULTS).
 
-    Returns number of rows inserted.
+    Deduplication strategy:
+      - Reverse / Forward tables: NOT EXISTS on (CHUNK_ID, APPLICATION_NAME,
+        VERSION) — re-running the same app+version inserts nothing new.
+      - Results table: DELETE for (APPLICATION_NAME, VERSION) then INSERT —
+        generated outputs are replaced on every successful run.
+
+    CHUNK_ID is a SHA2-256 hash of (application_name, version, artifact_type,
+    chunk_id) making it stable and repeatable across runs.
+
+    Embedding is done via a single batch INSERT-SELECT per phase table so
+    Snowflake fans out the EMBED_TEXT calls across the warehouse rather than
+    issuing one round-trip per chunk.
+
+    Returns {"reverse_eng": N, "forward_eng": N, "results": N, "total": N}.
     """
+    import hashlib
+
     if not chunks:
-        return 0
+        return {"reverse_eng": 0, "forward_eng": 0, "results": 0, "total": 0}
 
     ver_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", version.strip()) or "v0"
-    full_table = _fqn(table)
+    app_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", application_name.strip()) or "app"
+    # Phase tables are always VECTOR(FLOAT, 1024) — ignore caller's dim.
+    embed_fn = f"SNOWFLAKE.CORTEX.EMBED_TEXT_{PHASE_TABLE_DIM}"
 
-    # Idempotency: clear any previous rows for this (version, model)
-    session.sql(
-        f"DELETE FROM {full_table} "
-        f"WHERE VERSION = ? AND EMBEDDING_MODEL = ?",
-        params=[ver_slug, embed_model],
-    ).collect()
+    # ── Step 1: build staging tuples grouped by target phase table ───────
+    # Each tuple matches _SC column order below. Using a flat list of values
+    # avoids Snowpark DataFrame / save_as_table, which can fail silently in
+    # Streamlit-in-Snowflake when writing many rows.
+    from collections import defaultdict
 
-    # Batch the inserts — one row at a time is slow but most reliable in
-    # SiS where bulk binds across VECTOR columns can be finicky. Callers
-    # see progress via progress_cb.
-    inserted = 0
-    for i, c in enumerate(chunks):
-        row_id = f"{ver_slug}::{embed_model}::{c['artifact_type']}::{c['chunk_id']}"
-        # Cortex EMBED function name depends on dimension
-        embed_fn = f"SNOWFLAKE.CORTEX.EMBED_TEXT_{dim}"
-        session.sql(
-            f"""
-            INSERT INTO {full_table}
-              (ROW_ID, VERSION, DATA_DOMAIN, ARTIFACT_TYPE,
-               ARTIFACT_LABEL, CHUNK_ID, ENTITY, CONTENT, METADATA,
-               EMBEDDING_MODEL, EMBEDDING)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, PARSE_JSON(?), ?,
-                   {embed_fn}(?, ?)
-            """,
-            params=[
-                row_id, ver_slug, c["data_domain"], c["artifact_type"],
-                c["artifact_label"], c["chunk_id"], c.get("entity", ""),
-                c["content"], json.dumps(c.get("metadata", {})),
-                embed_model, embed_model, c["content"],
-            ],
-        ).collect()
-        inserted += 1
-        if progress_cb and (i % 5 == 0 or i == len(chunks) - 1):
-            progress_cb(inserted, len(chunks))
+    # Column order for the inline VALUES sub-table
+    _SC = [
+        "CHUNK_ID", "APPLICATION_NAME", "VERSION", "DATA_DOMAIN",
+        "ARTIFACT_TYPE", "ARTIFACT_LABEL", "ENTITY", "SOURCE_SYSTEM",
+        "FILE_PATH", "DBT_LAYER", "FILE_CATEGORY",
+        "RESULT_TYPE", "RUN_STATUS", "GENERATED_BY",
+        "CONTENT", "METADATA_JSON", "EMBEDDING_MODEL",
+    ]
+    _SC_NAMES = ", ".join(_SC)
+    _ROW_PH   = "(" + ", ".join(["?" for _ in _SC]) + ")"
+    BATCH     = 20  # rows per SQL call — keeps param count manageable
 
-    return inserted
+    by_table: dict = defaultdict(list)
+    for c in chunks:
+        target = _route_chunk_to_table(c.get("artifact_type", ""))
+        raw_id = (
+            f"{app_slug}::{ver_slug}"
+            f"::{c.get('artifact_type', '')}"
+            f"::{c.get('chunk_id', '')}"
+        )
+        chunk_id = hashlib.sha256(raw_id.encode()).hexdigest()
+        by_table[target].append([
+            chunk_id,
+            app_slug,
+            ver_slug,
+            c.get("data_domain")    or "UNCLASSIFIED",
+            c.get("artifact_type")  or "",
+            c.get("artifact_label") or "",
+            c.get("entity")         or "",
+            c.get("source_system")  or "",
+            c.get("file_path")      or "",
+            c.get("dbt_layer")      or "",
+            c.get("file_category")  or "",
+            c.get("artifact_type")  or "",   # RESULT_TYPE mirrors ARTIFACT_TYPE
+            "SUCCESS",
+            embed_model,                     # GENERATED_BY
+            c.get("content") or "",
+            json.dumps(c.get("metadata") or {}),
+            embed_model,                     # EMBEDDING_MODEL
+        ])
+
+    counts = {"reverse_eng": 0, "forward_eng": 0, "results": 0}
+    total_done = 0
+    total_chunks = len(chunks)
+
+    # ── Step 2: insert each phase table in batches via inline VALUES ──────
+    for phase_table, phase_rows in by_table.items():
+        if not phase_rows:
+            continue
+
+        fq_phase = _fqn(phase_table)
+
+        # Results table: idempotent replacement — clear old rows first
+        if phase_table == VECTORS_RESULTS:
+            session.sql(
+                f"DELETE FROM {fq_phase} WHERE APPLICATION_NAME=? AND VERSION=?",
+                params=[app_slug, ver_slug],
+            ).collect()
+
+        for i in range(0, len(phase_rows), BATCH):
+            batch   = phase_rows[i : i + BATCH]
+            vals_ph = ", ".join([_ROW_PH for _ in batch])
+            params  = [v for row in batch for v in row]
+
+            if phase_table == VECTORS_RESULTS:
+                ins_sql = f"""
+                    INSERT INTO {fq_phase}
+                      (CHUNK_ID, APPLICATION_NAME, VERSION,
+                       RESULT_TYPE, DATA_DOMAIN, ENTITY,
+                       FILE_PATH, RUN_STATUS, GENERATED_BY,
+                       CONTENT, METADATA, EMBEDDING_MODEL, EMBEDDING)
+                    SELECT
+                      s.CHUNK_ID, s.APPLICATION_NAME, s.VERSION,
+                      s.RESULT_TYPE, s.DATA_DOMAIN, s.ENTITY,
+                      s.FILE_PATH, s.RUN_STATUS, s.GENERATED_BY,
+                      s.CONTENT, PARSE_JSON(s.METADATA_JSON),
+                      s.EMBEDDING_MODEL,
+                      {embed_fn}(s.EMBEDDING_MODEL, s.CONTENT)
+                    FROM (VALUES {vals_ph}) AS s({_SC_NAMES})
+                    WHERE s.CONTENT != ''
+                """
+            elif phase_table == VECTORS_FORWARD_ENG:
+                ins_sql = f"""
+                    INSERT INTO {fq_phase}
+                      (CHUNK_ID, APPLICATION_NAME, VERSION,
+                       DATA_DOMAIN, ARTIFACT_TYPE, ARTIFACT_LABEL,
+                       ENTITY, FILE_PATH, DBT_LAYER, FILE_CATEGORY,
+                       CONTENT, METADATA, EMBEDDING_MODEL, EMBEDDING)
+                    SELECT
+                      s.CHUNK_ID, s.APPLICATION_NAME, s.VERSION,
+                      s.DATA_DOMAIN, s.ARTIFACT_TYPE, s.ARTIFACT_LABEL,
+                      s.ENTITY, s.FILE_PATH, s.DBT_LAYER, s.FILE_CATEGORY,
+                      s.CONTENT, PARSE_JSON(s.METADATA_JSON),
+                      s.EMBEDDING_MODEL,
+                      {embed_fn}(s.EMBEDDING_MODEL, s.CONTENT)
+                    FROM (VALUES {vals_ph}) AS s({_SC_NAMES})
+                    WHERE s.CONTENT != ''
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {fq_phase} v
+                        WHERE v.CHUNK_ID         = s.CHUNK_ID
+                          AND v.APPLICATION_NAME = s.APPLICATION_NAME
+                          AND v.VERSION          = s.VERSION
+                      )
+                """
+            else:  # VECTORS_REVERSE_ENG
+                ins_sql = f"""
+                    INSERT INTO {fq_phase}
+                      (CHUNK_ID, APPLICATION_NAME, VERSION,
+                       DATA_DOMAIN, ARTIFACT_TYPE, ARTIFACT_LABEL,
+                       ENTITY, SOURCE_SYSTEM,
+                       CONTENT, METADATA, EMBEDDING_MODEL, EMBEDDING)
+                    SELECT
+                      s.CHUNK_ID, s.APPLICATION_NAME, s.VERSION,
+                      s.DATA_DOMAIN, s.ARTIFACT_TYPE, s.ARTIFACT_LABEL,
+                      s.ENTITY, s.SOURCE_SYSTEM,
+                      s.CONTENT, PARSE_JSON(s.METADATA_JSON),
+                      s.EMBEDDING_MODEL,
+                      {embed_fn}(s.EMBEDDING_MODEL, s.CONTENT)
+                    FROM (VALUES {vals_ph}) AS s({_SC_NAMES})
+                    WHERE s.CONTENT != ''
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {fq_phase} v
+                        WHERE v.CHUNK_ID         = s.CHUNK_ID
+                          AND v.APPLICATION_NAME = s.APPLICATION_NAME
+                          AND v.VERSION          = s.VERSION
+                      )
+                """
+
+            try:
+                session.sql(ins_sql, params=params).collect()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Embedding failed for "
+                    f"{PHASE_LABELS.get(phase_table, phase_table)}: {exc}"
+                ) from exc
+
+            total_done += len(batch)
+            if progress_cb:
+                progress_cb(total_done, total_chunks)
+
+        # Count rows stored for this phase
+        try:
+            n = session.sql(
+                f"SELECT COUNT(*) AS N FROM {fq_phase} "
+                f"WHERE APPLICATION_NAME=? AND VERSION=?",
+                params=[app_slug, ver_slug],
+            ).collect()[0]["N"]
+        except Exception:
+            n = 0
+
+        if phase_table == VECTORS_REVERSE_ENG:
+            counts["reverse_eng"] = n
+        elif phase_table == VECTORS_FORWARD_ENG:
+            counts["forward_eng"] = n
+        else:
+            counts["results"] = n
+
+    # ── Step 3: upsert APP_RUN_REGISTRY per-phase status ─────────────────
+    try:
+        session.sql(f"""
+            MERGE INTO {_fqn(APP_RUN_REGISTRY)} AS T
+            USING (SELECT ? AS APPLICATION_NAME, ? AS VERSION) AS S
+              ON T.APPLICATION_NAME = S.APPLICATION_NAME
+             AND T.VERSION          = S.VERSION
+            WHEN MATCHED THEN UPDATE SET
+                REVERSE_ENG_STATUS = 'READY',
+                REVERSE_ENG_CHUNKS = ?,
+                FORWARD_ENG_STATUS = 'READY',
+                FORWARD_ENG_CHUNKS = ?,
+                RESULTS_STATUS     = 'READY',
+                RESULTS_CHUNKS     = ?,
+                LAST_UPDATED       = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN INSERT
+                (APPLICATION_NAME, VERSION,
+                 REVERSE_ENG_STATUS, REVERSE_ENG_CHUNKS,
+                 FORWARD_ENG_STATUS, FORWARD_ENG_CHUNKS,
+                 RESULTS_STATUS,     RESULTS_CHUNKS,
+                 LAST_UPDATED)
+            VALUES (?, ?, 'READY', ?, 'READY', ?, 'READY', ?,
+                    CURRENT_TIMESTAMP())
+        """, params=[
+            app_slug, ver_slug,
+            counts["reverse_eng"], counts["forward_eng"], counts["results"],
+            app_slug, ver_slug,
+            counts["reverse_eng"], counts["forward_eng"], counts["results"],
+        ]).collect()
+    except Exception:
+        pass  # registry failure must not block the caller
+
+    counts["total"] = counts["reverse_eng"] + counts["forward_eng"] + counts["results"]
+    return counts
 
 
-def semantic_search(session, query: str, table: str, dim: int,
-                    embed_model: str, version: str = None,
-                    data_domain: str = None, artifact_type: str = None,
+def semantic_search(session, query: str, embed_model: str, dim: int,
+                    application_name: str = None,
+                    phase: str = None,
+                    version: str = None,
+                    data_domain: str = None,
+                    artifact_type: str = None,
                     top_k: int = 10) -> "pd.DataFrame":
     """
-    Find the most semantically similar chunks using vector cosine
-    similarity. Optional filters on version, data_domain, artifact_type.
-    """
-    filters = ["EMBEDDING_MODEL = ?"]
-    params  = [embed_model]
-    if version:
-        ver_slug = re.sub(r"[^A-Za-z0-9._-]+", "_", version.strip()) or "v0"
-        filters.append("VERSION = ?")
-        params.append(ver_slug)
-    if data_domain and data_domain != "(any)":
-        filters.append("DATA_DOMAIN = ?")
-        params.append(data_domain)
-    if artifact_type and artifact_type != "(any)":
-        filters.append("ARTIFACT_TYPE = ?")
-        params.append(artifact_type)
+    Find the most semantically similar chunks using vector cosine similarity.
 
-    where = " AND ".join(filters)
+    phase selects which table to query:
+      'reverse_eng' → VECTORS_REVERSE_ENG
+      'forward_eng' → VECTORS_FORWARD_ENG
+      'results'     → VECTORS_RESULTS
+      None          → union across all three tables
+
+    application_name scopes results to a single pipeline run so different
+    projects stored in the same tables don't pollute each other's results.
+    """
     embed_fn = f"SNOWFLAKE.CORTEX.EMBED_TEXT_{dim}"
+
+    _phase_map = {
+        "reverse_eng": VECTORS_REVERSE_ENG,
+        "forward_eng": VECTORS_FORWARD_ENG,
+        "results":     VECTORS_RESULTS,
+    }
+    tables_to_query = (
+        [_phase_map[phase]] if phase and phase in _phase_map
+        else list(_phase_map.values())
+    )
+
+    ver_slug = (
+        re.sub(r"[^A-Za-z0-9._-]+", "_", version.strip()) or "v0"
+        if version else None
+    )
+    app_slug = (
+        re.sub(r"[^A-Za-z0-9._-]+", "_", application_name.strip()) or None
+        if application_name else None
+    )
+
+    # Common columns present in all three tables
+    _common_select = """
+        CHUNK_ID,
+        APPLICATION_NAME,
+        VERSION,
+        DATA_DOMAIN,
+        ARTIFACT_TYPE,
+        ENTITY,
+        CONTENT,
+        EMBEDDING_MODEL,
+        VECTOR_COSINE_SIMILARITY(
+            EMBEDDING,
+            {embed_fn}(?, ?)
+        ) AS SIMILARITY
+    """
+
+    union_parts = []
+    all_params  = []
+
+    for tbl in tables_to_query:
+        # Common filters for every table
+        filters = ["EMBEDDING_MODEL = ?"]
+        params  = [embed_model]
+        if app_slug:
+            filters.append("APPLICATION_NAME = ?")
+            params.append(app_slug)
+        if ver_slug:
+            filters.append("VERSION = ?")
+            params.append(ver_slug)
+        if data_domain and data_domain != "(any)":
+            filters.append("DATA_DOMAIN = ?")
+            params.append(data_domain)
+        if artifact_type and artifact_type != "(any)":
+            filters.append("ARTIFACT_TYPE = ?")
+            params.append(artifact_type)
+
+        where = " AND ".join(filters)
+        part = f"""
+            SELECT
+                CHUNK_ID,
+                APPLICATION_NAME,
+                VERSION,
+                DATA_DOMAIN,
+                ARTIFACT_TYPE,
+                ENTITY,
+                CONTENT,
+                EMBEDDING_MODEL,
+                '{PHASE_LABELS.get(tbl, tbl)}' AS PHASE,
+                VECTOR_COSINE_SIMILARITY(
+                    EMBEDDING, {embed_fn}(?, ?)
+                ) AS SIMILARITY
+            FROM {_fqn(tbl)}
+            WHERE {where}
+        """
+        # embed binds come first (before filter binds) per Snowflake convention
+        all_params += [embed_model, query] + params
+        union_parts.append(part)
+
+    combined_sql = "\nUNION ALL\n".join(union_parts)
     sql = f"""
-        SELECT
-            VERSION,
-            DATA_DOMAIN,
-            ARTIFACT_TYPE,
-            ARTIFACT_LABEL,
-            CHUNK_ID,
-            ENTITY,
-            CONTENT,
-            VECTOR_COSINE_SIMILARITY(
-                EMBEDDING,
-                {embed_fn}(?, ?)
-            ) AS SIMILARITY
-        FROM {_fqn(table)}
-        WHERE {where}
+        SELECT * FROM ({combined_sql}) Q
         ORDER BY SIMILARITY DESC
         LIMIT {int(top_k)}
     """
-    # The query embedding binds come first so they're before the filter binds
-    all_params = [embed_model, query] + params
-    df = session.sql(sql, params=all_params).to_pandas()
-    return df
+    return session.sql(sql, params=all_params).to_pandas()
 
 
 def list_stored_versions(session) -> "pd.DataFrame":
     """
-    List all (version, embedding_model) combinations present in the
-    vector tables, along with row counts and domain counts. Used by the
-    View Artifacts tab to populate the version dropdown.
+    List all (application_name, version, embedding_model, phase) combinations
+    present in the three phase-specific vector tables. Used by the View
+    Artifacts tab to populate dropdowns and show a summary of what's stored.
     """
+    _phase_tables = [
+        (VECTORS_REVERSE_ENG, "Reverse Engineering"),
+        (VECTORS_FORWARD_ENG, "Forward Engineering"),
+        (VECTORS_RESULTS,     "Results"),
+    ]
     rows = []
-    for label, (model, dim, table) in EMBED_MODELS.items():
+    for table, phase_label in _phase_tables:
         try:
             r = session.sql(f"""
                 SELECT
+                    APPLICATION_NAME,
                     VERSION,
                     EMBEDDING_MODEL,
                     COUNT(*)                         AS CHUNK_COUNT,
                     COUNT(DISTINCT DATA_DOMAIN)      AS DOMAIN_COUNT,
                     COUNT(DISTINCT ARTIFACT_TYPE)    AS TYPE_COUNT,
-                    MIN(CREATED_AT)                  AS FIRST_LOADED,
-                    MAX(CREATED_AT)                  AS LAST_LOADED
+                    MIN(EMBEDDED_AT)                 AS FIRST_LOADED,
+                    MAX(EMBEDDED_AT)                 AS LAST_LOADED
                 FROM {_fqn(table)}
-                GROUP BY VERSION, EMBEDDING_MODEL
+                GROUP BY APPLICATION_NAME, VERSION, EMBEDDING_MODEL
                 ORDER BY LAST_LOADED DESC
             """).collect()
             for row in r:
                 rows.append({
-                    "version":      row["VERSION"],
-                    "model":        row["EMBEDDING_MODEL"],
-                    "model_label":  label,
-                    "dim":          dim,
-                    "table":        table,
-                    "chunk_count":  row["CHUNK_COUNT"],
-                    "domain_count": row["DOMAIN_COUNT"],
-                    "type_count":   row["TYPE_COUNT"],
-                    "first_loaded": row["FIRST_LOADED"],
-                    "last_loaded":  row["LAST_LOADED"],
+                    "application_name": row["APPLICATION_NAME"],
+                    "version":          row["VERSION"],
+                    "model":            row["EMBEDDING_MODEL"],
+                    "phase":            phase_label,
+                    "table":            table,
+                    "chunk_count":      row["CHUNK_COUNT"],
+                    "domain_count":     row["DOMAIN_COUNT"],
+                    "type_count":       row["TYPE_COUNT"],
+                    "first_loaded":     row["FIRST_LOADED"],
+                    "last_loaded":      row["LAST_LOADED"],
                 })
         except Exception:
-            # Table doesn't exist yet — skip
             continue
     return pd.DataFrame(rows)
 
@@ -1923,19 +2434,22 @@ def list_stage_bundles(session) -> list:
             continue
         if not str(name).endswith(".zip"):
             continue
-        # name looks like: artifacts_stage/v1.0.0/artifacts_v1.0.0.zip
+        # Stage path format: <stage_name>/v<ver_slug>/<filename>.zip
+        # upload_artifacts_to_stage prepends "v" to ver_slug (line 1492),
+        # so the folder is "v1.0.0" or "vqg-1.0.0" etc.
+        # version_slug must match the VERSION column in the vector tables
+        # which stores ver_slug WITHOUT the leading "v".
         parts = str(name).split("/")
-        ver = ""
-        for p in parts:
-            if p.startswith("v") and len(p) > 1:
-                ver = p[1:]
-                break
+        filename   = parts[-1] if parts else str(name)
+        ver_folder = parts[-2] if len(parts) >= 2 else ""
+        # Strip exactly one leading "v" added by upload_artifacts_to_stage
+        ver_slug_  = ver_folder[1:] if ver_folder.startswith("v") else ver_folder
         out.append({
             "path":          "@" + str(name),
             "size":          _row_get(r, "size", "SIZE", default=0),
             "last_modified": _row_get(r, "last_modified", "LAST_MODIFIED"),
-            "version_slug":  ver,
-            "filename":      parts[-1] if parts else str(name),
+            "version_slug":  ver_slug_,
+            "filename":      filename,
         })
     # Sort newest-first. last_modified from LIST @stage is an RFC 2822
     # string ("Wed, 16 Apr 2026 12:00:00 GMT") which doesn't sort
@@ -6119,24 +6633,284 @@ def _render_tab_quickgo():
                 _qg_render_tracker()
             try:
                 if step_key == "STTM":
-                    # STTM is generated BEFORE the Raw Vault Model. The
-                    # `pre_raw_vault=True` mode produces a clean
-                    # source-to-staging mapping with NO Hub / Link /
-                    # Satellite / Raw Vault terminology. The vault
-                    # design is intentionally a separate downstream
-                    # concern — review STTM standalone first.
-                    # If the user uploaded an STTM template, its header
-                    # becomes the authoritative output schema.
+                    # STTM is generated BEFORE the Raw Vault Model. In
+                    # `pre_raw_vault=True` mode the prompt now emits
+                    # TWO CSV sections separated by a marker line:
+                    #   1. SOURCE → STAGE   (one row per source column)
+                    #   2. STAGE  → TARGET  (one row per target column)
+                    # Both sections are derived from the parsed
+                    # Reverse-Engineering Inputs (qg_meta + entities).
+                    # We also derive a raw-source DDL plus a small
+                    # synthetic dummy-data INSERT block so reviewers can
+                    # see the source structure they're mapping FROM.
                     raw = _qg_call(build_sttm_prompt(
                         qg_meta, pre_raw_vault=True,
                         sttm_template_text=st.session_state.get(
                             "qg_sttm_template_text", ""),
                     ))
-                    df = parse_table_response(raw)
+
+                    # ── Split the two-section response ───────────────
+                    # The prompt instructs the model to emit:
+                    #   # === SECTION: SOURCE_TO_STAGE ===
+                    #   <CSV>
+                    #   # === SECTION: STAGE_TO_TARGET ===
+                    #   <CSV>
+                    # Matching is case-insensitive and handles variant
+                    # spacing so models that slightly rephrase the
+                    # marker are still handled correctly.
+                    s2s_df = None
+                    s2t_df = None
+                    sttm_combined_df = None
+                    raw_text = raw or ""
+
+                    def _find_marker_ci(text: str, keyword: str):
+                        """Return (start_idx, end_idx) of the first line
+                        that contains `keyword` (case-insensitive), or
+                        (-1, -1) if not found."""
+                        upper = text.upper()
+                        kw = keyword.upper()
+                        idx = upper.find(kw)
+                        if idx == -1:
+                            return -1, -1
+                        # Walk back to start of that line
+                        line_start = text.rfind("\n", 0, idx)
+                        line_start = 0 if line_start == -1 else line_start + 1
+                        # Walk forward to end of that line
+                        line_end = text.find("\n", idx)
+                        line_end = len(text) if line_end == -1 else line_end
+                        return line_start, line_end
+
+                    def _strip_fences(blob: str) -> str:
+                        """Remove markdown code fences that the LLM may
+                        wrap around the CSV block."""
+                        s = blob.strip()
+                        if s.startswith("```"):
+                            first_nl = s.find("\n")
+                            if first_nl != -1:
+                                s = s[first_nl + 1:]
+                            if s.rstrip().endswith("```"):
+                                s = s.rstrip()[:-3].rstrip()
+                        return s.strip()
+
+                    s2t_start, s2t_end = _find_marker_ci(
+                        raw_text, "STAGE_TO_TARGET"
+                    )
+                    if s2t_start >= 0:
+                        # Two-section path
+                        s2s_start, s2s_end = _find_marker_ci(
+                            raw_text, "SOURCE_TO_STAGE"
+                        )
+                        # Everything between the two markers is the S2S blob
+                        if s2s_start >= 0:
+                            s2s_blob = raw_text[s2s_end:s2t_start].strip()
+                        else:
+                            s2s_blob = raw_text[:s2t_start].strip()
+                        s2t_blob = raw_text[s2t_end:].strip()
+
+                        try:
+                            s2s_df = parse_table_response(
+                                _strip_fences(s2s_blob)
+                            )
+                        except Exception:
+                            s2s_df = None
+                        try:
+                            s2t_df = parse_table_response(
+                                _strip_fences(s2t_blob)
+                            )
+                        except Exception:
+                            s2t_df = None
+                    else:
+                        # Single-section fallback (user template path or
+                        # model that only produced one section)
+                        sttm_combined_df = parse_table_response(
+                            _strip_fences(raw_text)
+                        )
+
+                    # ── Build raw-source DDL + dummy data ────────────
+                    # Driven directly from `qg_all_entities` so it
+                    # matches whatever the parsers actually pulled out
+                    # of the uploads — independent of the STTM model
+                    # response. Generates one CREATE TABLE per
+                    # discovered source entity plus 5 sample
+                    # INSERT rows per table.
+                    src_ddl_parts = []
+                    src_dml_parts = []
+                    src_table_summary = []
+                    seen_table_names = set()
+                    import random as _qg_rand
+                    _qg_rand.seed(42)
+
+                    def _qg_safe_table_name(meta):
+                        """Build a Snowflake-friendly raw-source table
+                        name from an entity record."""
+                        base = (meta.get("display_name") or
+                                meta.get("source_file") or "ENTITY")
+                        cleaned = re.sub(
+                            r"[^A-Za-z0-9_]+", "_", str(base),
+                        ).strip("_").upper() or "ENTITY"
+                        if cleaned in seen_table_names:
+                            # Disambiguate by appending the job name
+                            job = re.sub(
+                                r"[^A-Za-z0-9_]+", "_",
+                                str(meta.get("job_name") or "")
+                            ).strip("_").upper()
+                            if job:
+                                cleaned = f"{cleaned}__{job}"
+                        i = 1
+                        candidate = cleaned
+                        while candidate in seen_table_names:
+                            i += 1
+                            candidate = f"{cleaned}_{i}"
+                        seen_table_names.add(candidate)
+                        return candidate
+
+                    def _qg_dummy_value(col_name, col_type, row_idx):
+                        """Generate a plausible dummy value based on
+                        column name + Snowflake type. Returns a string
+                        suitable for inlining into a VALUES clause
+                        (already quoted / cast where needed)."""
+                        cn = (col_name or "").upper()
+                        ct = (col_type or "").upper()
+                        # Type-driven defaults
+                        if any(k in ct for k in (
+                            "NUMBER", "INT", "DECIMAL", "NUMERIC",
+                            "FLOAT", "DOUBLE", "REAL",
+                        )):
+                            if "AMT" in cn or "AMOUNT" in cn or \
+                                    "BALANCE" in cn or "PRICE" in cn:
+                                return f"{_qg_rand.uniform(10, 9999):.2f}"
+                            if "QTY" in cn or "COUNT" in cn:
+                                return str(_qg_rand.randint(1, 50))
+                            return str(1000 + row_idx)
+                        if "DATE" in ct and "TIME" not in ct:
+                            return f"'2024-{(row_idx % 12) + 1:02d}-{(row_idx % 27) + 1:02d}'"
+                        if "TIMESTAMP" in ct or "DATETIME" in ct:
+                            return (
+                                f"'2024-{(row_idx % 12) + 1:02d}-"
+                                f"{(row_idx % 27) + 1:02d} "
+                                f"{(row_idx % 23):02d}:00:00'"
+                            )
+                        if "BOOL" in ct:
+                            return "TRUE" if row_idx % 2 == 0 else "FALSE"
+                        # Name-driven defaults for VARCHAR / unknown
+                        if "EMAIL" in cn:
+                            return f"'user{row_idx + 1}@example.com'"
+                        if "PHONE" in cn:
+                            return (
+                                f"'+1-555-"
+                                f"{1000 + row_idx:04d}'"
+                            )
+                        if "ZIP" in cn or "POSTAL" in cn:
+                            return f"'{10000 + row_idx * 7}'"
+                        if "STATE" in cn:
+                            return _qg_rand.choice([
+                                "'NC'", "'CA'", "'NY'", "'TX'", "'IL'",
+                            ])
+                        if "COUNTRY" in cn:
+                            return "'US'"
+                        if "CITY" in cn:
+                            return _qg_rand.choice([
+                                "'Raleigh'", "'San Francisco'",
+                                "'New York'", "'Austin'", "'Chicago'",
+                            ])
+                        if "NAME" in cn:
+                            base = _qg_rand.choice([
+                                "Alex", "Sam", "Jordan", "Taylor",
+                                "Morgan", "Riley", "Casey",
+                            ])
+                            return f"'{base} #{row_idx + 1}'"
+                        if "ID" == cn or cn.endswith("_ID") or \
+                                cn.endswith("ID"):
+                            # ID-like: treat as VARCHAR-style key
+                            return f"'{cn[:3] or 'ID'}{row_idx + 1:05d}'"
+                        if "STATUS" in cn:
+                            return _qg_rand.choice([
+                                "'ACTIVE'", "'PENDING'", "'CLOSED'",
+                            ])
+                        if "FLAG" in cn:
+                            return "'Y'" if row_idx % 2 == 0 else "'N'"
+                        # Generic VARCHAR fallback
+                        return f"'sample_{row_idx + 1}'"
+
+                    DUMMY_ROWS = 5
+                    for ent_key, meta in qg_all_entities.items():
+                        cols = sorted(meta.get("columns") or [])
+                        if not cols:
+                            continue
+                        typed = meta.get("columns_typed") or {}
+                        tbl = _qg_safe_table_name(meta)
+                        src_table_summary.append({
+                            "Source File": meta.get("source_file", ""),
+                            "Job":         meta.get("job_name", "") or "",
+                            "Stage Type":  meta.get("type", "") or "",
+                            "Tech Stack":  meta.get("tech", ""),
+                            "Entity":      meta.get("display_name", ""),
+                            "Raw Table":   f"RAW.{tbl}",
+                            "Columns":     len(cols),
+                        })
+                        # CREATE TABLE
+                        col_lines = []
+                        for c in cols:
+                            t = typed.get(c) or "VARCHAR"
+                            col_lines.append(f"    {c} {t}")
+                        ddl = (
+                            f"-- Source: {meta.get('source_file', '')}"
+                            f"  •  Entity: {meta.get('display_name', '')}\n"
+                            f"CREATE OR REPLACE TABLE RAW.{tbl} (\n"
+                            + ",\n".join(col_lines)
+                            + "\n);"
+                        )
+                        src_ddl_parts.append(ddl)
+                        # INSERT rows
+                        col_csv = ", ".join(cols)
+                        value_lines = []
+                        for ridx in range(DUMMY_ROWS):
+                            vals = [
+                                _qg_dummy_value(c, typed.get(c, ""), ridx)
+                                for c in cols
+                            ]
+                            value_lines.append(
+                                "    (" + ", ".join(vals) + ")"
+                            )
+                        dml = (
+                            f"-- Dummy data for RAW.{tbl}\n"
+                            f"INSERT INTO RAW.{tbl} ({col_csv}) VALUES\n"
+                            + ",\n".join(value_lines)
+                            + ";"
+                        )
+                        src_dml_parts.append(dml)
+
+                    src_ddl_text = "\n\n".join(src_ddl_parts) or (
+                        "-- No source entities with columns were "
+                        "discovered by the parsers."
+                    )
+                    src_dml_text = "\n\n".join(src_dml_parts) or (
+                        "-- No source entities with columns were "
+                        "discovered — nothing to seed."
+                    )
+                    try:
+                        src_summary_df = (
+                            pd.DataFrame(src_table_summary)
+                            if src_table_summary else None
+                        )
+                    except Exception:
+                        src_summary_df = None
+
                     qg_arts["STTM"] = {
-                        "kind": "table",
+                        # Custom kind so the result panel can render
+                        # the two STTM dataframes plus the raw-source
+                        # DDL + dummy data tabs.
+                        "kind": "sttm_split",
                         "label": "Source-to-Target Mapping",
-                        "content": {"df": df, "raw": raw},
+                        "content": {
+                            "s2s_df":          s2s_df,
+                            "s2t_df":          s2t_df,
+                            "combined_df":     sttm_combined_df,
+                            "raw":             raw,
+                            "source_ddl":      src_ddl_text,
+                            "source_dml":      src_dml_text,
+                            "source_summary":  src_summary_df,
+                        },
                     }
 
                 elif step_key == "Data Lineage":
@@ -6501,7 +7275,7 @@ def _render_tab_quickgo():
                         data_catalog_text=cat_art.get("raw", "") or "",
                         source_to_hub_text=sth_text,
                     )
-                    val_raw = _qg_call(val_prompt, max_tokens=12000)
+                    val_raw = _qg_call(val_prompt, max_tokens=16000)
 
                     # Best-effort JSON parsing — the model may wrap the
                     # JSON in stray prose or fences despite instructions.
@@ -6546,6 +7320,74 @@ def _render_tab_quickgo():
                             _stripped = _stripped[first_nl + 1:]
                         if _stripped.rstrip().endswith("```"):
                             _stripped = _stripped.rstrip()[:-3].rstrip()
+
+                    def _repair_truncated_json(blob: str) -> str:
+                        """
+                        When the LLM response is truncated mid-token the
+                        JSON ends with an open string, array, or object.
+                        Strategy:
+                          1. Find the last position where the brace/bracket
+                             depth is zero — everything up to that point is
+                             syntactically complete.
+                          2. If no such position exists, close any open
+                             string then close all open containers in reverse
+                             order (] for [ and } for {).
+                        Returns the original blob if it's already valid.
+                        """
+                        try:
+                            json.loads(blob)
+                            return blob  # already valid
+                        except Exception:
+                            pass
+                        # Walk the string tracking open containers
+                        stack = []      # '[' or '{'
+                        in_str = False
+                        esc = False
+                        last_clean_pos = -1  # last pos where depth == 0
+                        for i, ch in enumerate(blob):
+                            if esc:
+                                esc = False
+                                continue
+                            if ch == "\\" and in_str:
+                                esc = True
+                                continue
+                            if ch == '"':
+                                in_str = not in_str
+                                continue
+                            if in_str:
+                                continue
+                            if ch in ("{", "["):
+                                stack.append(ch)
+                            elif ch in ("}", "]"):
+                                if stack:
+                                    stack.pop()
+                                if not stack:
+                                    last_clean_pos = i
+                        if not stack:
+                            # Depth returned to 0 somewhere — return up to
+                            # that point (strips trailing prose/truncation)
+                            if last_clean_pos > 0:
+                                return blob[:last_clean_pos + 1]
+                            return blob
+                        # Still open: close open string then containers
+                        tail = ""
+                        if in_str:
+                            tail += '"'   # close the dangling string
+                        # Close any open value that needs a terminator
+                        if tail and stack and stack[-1] == "{":
+                            tail += '"_truncated_"'   # complete a key:value
+                        closing = {"[": "]", "{": "}"}
+                        for opener in reversed(stack):
+                            tail += closing.get(opener, "")
+                        repaired = blob.rstrip().rstrip(",") + tail
+                        try:
+                            json.loads(repaired)
+                            return repaired
+                        except Exception:
+                            return blob  # repair failed; return original
+
+                    # Pass 0: truncation repair before anything else
+                    _stripped = _repair_truncated_json(_stripped)
 
                     # Pass 1: direct parse of the unwrapped/de-fenced text
                     try:
@@ -6857,19 +7699,51 @@ def _render_tab_quickgo():
                 elif step_key == "Forward STTM":
                     bv_nar = qg_arts.get("Business Vault", {}) \
                                   .get("content", {}).get("narrative_md", "")
+                    # End-to-end Forward STTM (Phase 2) — walks every
+                    # column from raw Source through Raw Vault to the
+                    # Business Vault / Semantic layer. We feed the
+                    # Forward generator FOUR things so it can build a
+                    # credible 3-stop lineage row:
+                    #   1. Business Vault narrative (final target)
+                    #   2. Raw Vault DDL          (intermediate layer)
+                    #   3. Source metadata        (original source)
+                    #   4. Source → Stage CSV     (Phase-1 STTM section
+                    #                              one — gives stage
+                    #                              names verbatim)
+                    rv_sql_for_fwd = (
+                        qg_arts.get("Raw Vault Model", {})
+                               .get("content", {}).get("sql", "")
+                        or ""
+                    )
+                    sttm_phase1_content = qg_arts.get("STTM", {}) \
+                                               .get("content", {})
+                    s2s_for_fwd = ""
+                    if sttm_phase1_content.get("s2s_df") is not None:
+                        try:
+                            s2s_for_fwd = (
+                                sttm_phase1_content["s2s_df"]
+                                .to_csv(index=False)
+                            )
+                        except Exception:
+                            s2s_for_fwd = ""
                     # Same uploaded STTM template that drove Phase 1's
                     # source-to-staging STTM also drives the forward
-                    # RV → BV / Semantic STTM, so both artifacts have a
-                    # consistent shape.
+                    # STTM, so all artifacts have a consistent shape.
                     raw = _qg_fwd_call(build_forward_sttm_prompt(
                         bv_nar, qg_reverse_summary, qg_dashboard_type,
                         sttm_template_text=st.session_state.get(
                             "qg_sttm_template_text", ""),
+                        raw_vault_sql=rv_sql_for_fwd,
+                        source_metadata_summary=qg_meta,
+                        source_to_stage_text=s2s_for_fwd,
                     ))
                     df = parse_table_response(raw)
                     qg_arts["Forward STTM"] = {
                         "kind": "table",
-                        "label": "STTM (RV → BV / Semantic)",
+                        "label": (
+                            "End-to-End STTM "
+                            "(Source → Raw Vault → Business Vault)"
+                        ),
                         "content": {"df": df, "raw": raw},
                     }
 
@@ -7166,6 +8040,14 @@ def _render_tab_quickgo():
             key="qg_vector_version_in",
         )
 
+        qg_app_name = st.text_input(
+            "Application name",
+            value=st.session_state.get("qg_app_name", "quickgo_pipeline"),
+            key="qg_app_name_in",
+            help="Unique name for this pipeline. Re-running with the same "
+                 "name + version skips already-embedded chunks.",
+        )
+
         qgc1, qgc2, qgc3 = st.columns(3)
 
         # Download all as zip
@@ -7239,14 +8121,13 @@ def _render_tab_quickgo():
         )
         if not qg_embed_label:
             qg_embed_label = list(EMBED_MODELS.keys())[0]
-        qg_embed_model, qg_embed_dim, qg_embed_table = \
-            EMBED_MODELS[qg_embed_label]
+        qg_embed_model, qg_embed_dim = EMBED_MODELS[qg_embed_label]
 
         if qgc3.button(
             "🧠 Store as vectors",
             use_container_width=True,
             key="qg_vectorize",
-            disabled=not qg_vector_version.strip(),
+            disabled=not qg_vector_version.strip() or not qg_app_name.strip(),
         ):
             try:
                 with st.spinner("Preparing chunks and embedding…"):
@@ -7256,17 +8137,21 @@ def _render_tab_quickgo():
                     if not chunks:
                         st.warning("No chunkable artifacts found.")
                     else:
-                        inserted = embed_and_store(
+                        counts = embed_and_store(
                             session,
                             chunks,
                             version=qg_vector_version,
+                            application_name=qg_app_name,
                             embed_model=qg_embed_model,
                             dim=qg_embed_dim,
-                            table=qg_embed_table,
                         )
+                        st.session_state["qg_app_name"] = qg_app_name
                         st.success(
-                            f"✓ Stored {inserted} vector rows in "
-                            f"`{VECTOR_DB}.{VECTOR_SCHEMA}.{qg_embed_table}`"
+                            f"✓ Stored **{counts['total']}** vectors "
+                            f"(RE: {counts['reverse_eng']}, "
+                            f"FE: {counts['forward_eng']}, "
+                            f"Results: {counts['results']}) "
+                            f"for **{qg_app_name}** v{qg_vector_version}"
                         )
             except Exception as e:
                 st.error(f"Vectorization failed: {e}")
@@ -7325,6 +8210,41 @@ def _render_tab_quickgo():
                         else:
                             raw_len = len(content.get("raw", "") or "")
                             st.caption(f"No parsed table. Raw size: {raw_len:,} chars")
+                    elif kind == "sttm_split":
+                        s2s_df = content.get("s2s_df")
+                        s2t_df = content.get("s2t_df")
+                        comb_df = content.get("combined_df")
+                        src_summary_df = content.get("source_summary")
+                        s2s_n = (len(s2s_df)
+                                 if s2s_df is not None
+                                 and hasattr(s2s_df, "__len__") else 0)
+                        s2t_n = (len(s2t_df)
+                                 if s2t_df is not None
+                                 and hasattr(s2t_df, "__len__") else 0)
+                        comb_n = (len(comb_df)
+                                  if comb_df is not None
+                                  and hasattr(comb_df, "__len__") else 0)
+                        src_n = (len(src_summary_df)
+                                 if src_summary_df is not None
+                                 and hasattr(src_summary_df, "__len__")
+                                 else 0)
+                        if s2s_n or s2t_n:
+                            st.caption(
+                                f"Source → Stage rows: {s2s_n:,}  •  "
+                                f"Stage → Target rows: {s2t_n:,}  •  "
+                                f"Source tables: {src_n:,}"
+                            )
+                        elif comb_n:
+                            st.caption(
+                                f"Combined STTM rows: {comb_n:,}  •  "
+                                f"Source tables: {src_n:,}"
+                            )
+                        else:
+                            raw_len = len(content.get("raw", "") or "")
+                            st.caption(
+                                f"STTM (parse pending). Raw size: "
+                                f"{raw_len:,} chars"
+                            )
                     elif kind == "raw_vault":
                         nar = content.get("narrative_md") or ""
                         mer = content.get("mermaid") or ""
@@ -7403,11 +8323,273 @@ def _render_tab_quickgo():
                             mime="text/csv",
                             key=f"qg_dl_{key}",
                         )
+                        # Excel export alongside CSV
+                        try:
+                            xls_bytes = df_to_excel_bytes(
+                                df, sheet_name=_slug(label)[:31] or "STTM",
+                            )
+                            st.download_button(
+                                f"⬇ Download {label} (Excel)",
+                                xls_bytes,
+                                file_name=f"qg_{_slug(label)}.xlsx",
+                                mime=(
+                                    "application/vnd.openxmlformats-"
+                                    "officedocument.spreadsheetml.sheet"
+                                ),
+                                key=f"qg_dl_xls_{key}",
+                            )
+                        except Exception:
+                            pass
                     else:
                         st.warning(
                             "No tabular data parsed. Showing raw output."
                         )
                         st.code(content.get("raw", "")[:5000])
+
+                elif kind == "sttm_split":
+                    # ─────────────────────────────────────────────────
+                    # Two-layer STTM (Source → Stage  ▸  Stage → Target)
+                    # plus raw-source DDL and dummy-data INSERTs that
+                    # describe the source side of the mapping. We
+                    # render four sub-tabs so each artifact has its
+                    # own panel without overwhelming a single view.
+                    # ─────────────────────────────────────────────────
+                    s2s_df  = content.get("s2s_df")
+                    s2t_df  = content.get("s2t_df")
+                    comb_df = content.get("combined_df")
+                    src_ddl = content.get("source_ddl") or ""
+                    src_dml = content.get("source_dml") or ""
+                    src_summary_df = content.get("source_summary")
+                    raw_blob = content.get("raw", "") or ""
+
+                    # If neither split DF was parsed AND we have a
+                    # single combined DF (user-template path), fall
+                    # back to a single-table view.
+                    have_split = (
+                        (s2s_df is not None and not s2s_df.empty) or
+                        (s2t_df is not None and not s2t_df.empty)
+                    )
+
+                    sttm_tab1, sttm_tab2, sttm_tab3, sttm_tab4 = st.tabs([
+                        "🔁 Source → Stage",
+                        "🎯 Stage → Target",
+                        "🗄 Raw Source DDL",
+                        "🧪 Dummy Data",
+                    ])
+
+                    with sttm_tab1:
+                        if s2s_df is not None and not s2s_df.empty:
+                            st.caption(
+                                f"One row per source column.  "
+                                f"Rows: {len(s2s_df):,}"
+                            )
+                            st.dataframe(
+                                s2s_df, use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.download_button(
+                                "⬇ Source → Stage CSV",
+                                s2s_df.to_csv(index=False).encode(),
+                                file_name=(
+                                    f"qg_{_slug(label)}_source_to_stage.csv"
+                                ),
+                                mime="text/csv",
+                                key=f"qg_dl_s2s_csv_{key}",
+                            )
+                            try:
+                                st.download_button(
+                                    "⬇ Source → Stage Excel",
+                                    df_to_excel_bytes(
+                                        s2s_df, sheet_name="Source_to_Stage",
+                                    ),
+                                    file_name=(
+                                        f"qg_{_slug(label)}"
+                                        f"_source_to_stage.xlsx"
+                                    ),
+                                    mime=(
+                                        "application/vnd.openxmlformats-"
+                                        "officedocument.spreadsheetml.sheet"
+                                    ),
+                                    key=f"qg_dl_s2s_xls_{key}",
+                                )
+                            except Exception:
+                                pass
+                        elif comb_df is not None and not comb_df.empty:
+                            st.info(
+                                "Single-section STTM (user template "
+                                "path). Showing combined mapping."
+                            )
+                            st.dataframe(
+                                comb_df, use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.download_button(
+                                "⬇ Combined STTM CSV",
+                                comb_df.to_csv(index=False).encode(),
+                                file_name=f"qg_{_slug(label)}.csv",
+                                mime="text/csv",
+                                key=f"qg_dl_sttm_combined_{key}",
+                            )
+                        else:
+                            st.warning(
+                                "Source → Stage section was not parsed "
+                                "from the model response. Showing raw "
+                                "output below."
+                            )
+                            st.code(raw_blob[:5000] or "(empty)")
+
+                    with sttm_tab2:
+                        if s2t_df is not None and not s2t_df.empty:
+                            st.caption(
+                                f"One row per target column.  "
+                                f"Rows: {len(s2t_df):,}"
+                            )
+                            st.dataframe(
+                                s2t_df, use_container_width=True,
+                                hide_index=True,
+                            )
+                            st.download_button(
+                                "⬇ Stage → Target CSV",
+                                s2t_df.to_csv(index=False).encode(),
+                                file_name=(
+                                    f"qg_{_slug(label)}_stage_to_target.csv"
+                                ),
+                                mime="text/csv",
+                                key=f"qg_dl_s2t_csv_{key}",
+                            )
+                            try:
+                                st.download_button(
+                                    "⬇ Stage → Target Excel",
+                                    df_to_excel_bytes(
+                                        s2t_df, sheet_name="Stage_to_Target",
+                                    ),
+                                    file_name=(
+                                        f"qg_{_slug(label)}"
+                                        f"_stage_to_target.xlsx"
+                                    ),
+                                    mime=(
+                                        "application/vnd.openxmlformats-"
+                                        "officedocument.spreadsheetml.sheet"
+                                    ),
+                                    key=f"qg_dl_s2t_xls_{key}",
+                                )
+                            except Exception:
+                                pass
+                        elif comb_df is not None and not comb_df.empty:
+                            st.info(
+                                "Single-section STTM (user template "
+                                "path). The combined mapping is shown "
+                                "in the Source → Stage tab."
+                            )
+                        else:
+                            st.warning(
+                                "Stage → Target section was not parsed "
+                                "from the model response."
+                            )
+
+                    # Combined Excel workbook (both sections in one
+                    # file, on separate sheets) — only when we have
+                    # the split.
+                    if have_split:
+                        try:
+                            from io import BytesIO as _qg_bio
+                            buf = _qg_bio()
+                            with pd.ExcelWriter(
+                                buf, engine="openpyxl",
+                            ) as xw:
+                                if s2s_df is not None and not s2s_df.empty:
+                                    s2s_df.to_excel(
+                                        xw, sheet_name="Source_to_Stage",
+                                        index=False,
+                                    )
+                                if s2t_df is not None and not s2t_df.empty:
+                                    s2t_df.to_excel(
+                                        xw, sheet_name="Stage_to_Target",
+                                        index=False,
+                                    )
+                            st.download_button(
+                                "⬇ Combined STTM Workbook (both sheets)",
+                                buf.getvalue(),
+                                file_name=f"qg_{_slug(label)}_combined.xlsx",
+                                mime=(
+                                    "application/vnd.openxmlformats-"
+                                    "officedocument.spreadsheetml.sheet"
+                                ),
+                                key=f"qg_dl_sttm_workbook_{key}",
+                            )
+                        except Exception:
+                            pass
+
+                    with sttm_tab3:
+                        # Raw-source DDL: one CREATE TABLE per
+                        # discovered source entity. The source summary
+                        # dataframe gives the user a quick at-a-glance
+                        # view of the entities the DDL covers.
+                        if (src_summary_df is not None and
+                                not src_summary_df.empty):
+                            st.caption(
+                                f"Discovered source entities: "
+                                f"{len(src_summary_df):,}"
+                            )
+                            st.dataframe(
+                                src_summary_df,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        st.markdown("**Raw source DDL (Snowflake)**")
+                        st.code(
+                            src_ddl[:60000], language="sql",
+                        )
+                        st.download_button(
+                            "⬇ Download Raw Source DDL",
+                            src_ddl.encode(),
+                            file_name=(
+                                f"qg_{_slug(label)}_raw_source_ddl.sql"
+                            ),
+                            mime="text/plain",
+                            key=f"qg_dl_src_ddl_{key}",
+                        )
+
+                    with sttm_tab4:
+                        st.caption(
+                            "5 synthetic rows per source table, with "
+                            "values inferred from column name + data "
+                            "type. Use to smoke-test the STG/TGT "
+                            "transforms before running real loads."
+                        )
+                        st.code(src_dml[:60000], language="sql")
+                        st.download_button(
+                            "⬇ Download Dummy Data INSERTs",
+                            src_dml.encode(),
+                            file_name=(
+                                f"qg_{_slug(label)}_dummy_data.sql"
+                            ),
+                            mime="text/plain",
+                            key=f"qg_dl_src_dml_{key}",
+                        )
+                        # Convenience: combined DDL + DML script that
+                        # can be pasted into a Snowflake worksheet to
+                        # set up a self-contained sandbox.
+                        combo = (
+                            "-- ===========================================\n"
+                            "-- Generated by Quick GO — Raw Source DDL\n"
+                            "-- ===========================================\n"
+                            f"{src_ddl}\n\n"
+                            "-- ===========================================\n"
+                            "-- Generated by Quick GO — Dummy data\n"
+                            "-- ===========================================\n"
+                            f"{src_dml}\n"
+                        )
+                        st.download_button(
+                            "⬇ Download DDL + Dummy Data (combined)",
+                            combo.encode(),
+                            file_name=(
+                                f"qg_{_slug(label)}"
+                                f"_raw_source_setup.sql"
+                            ),
+                            mime="text/plain",
+                            key=f"qg_dl_src_combo_{key}",
+                        )
 
                 elif kind == "raw_vault":
                     if content.get("narrative_md"):
@@ -7527,15 +8709,37 @@ def _render_tab_quickgo():
                                 inv_df, use_container_width=True,
                                 hide_index=True,
                             )
-                            st.download_button(
-                                "⬇ Download Inventory CSV",
-                                inv_df.to_csv(index=False).encode(),
-                                file_name=(
-                                    f"qg_{_slug(label)}_inventory.csv"
-                                ),
-                                mime="text/csv",
-                                key=f"qg_dl_lg_inv_{key}",
-                            )
+                            inv_dl_l, inv_dl_r = st.columns([1, 1])
+                            with inv_dl_l:
+                                st.download_button(
+                                    "⬇ Inventory CSV",
+                                    inv_df.to_csv(index=False).encode(),
+                                    file_name=(
+                                        f"qg_{_slug(label)}_inventory.csv"
+                                    ),
+                                    mime="text/csv",
+                                    key=f"qg_dl_lg_inv_{key}",
+                                )
+                            with inv_dl_r:
+                                try:
+                                    st.download_button(
+                                        "⬇ Inventory Excel",
+                                        df_to_excel_bytes(
+                                            inv_df, sheet_name="Inventory",
+                                        ),
+                                        file_name=(
+                                            f"qg_{_slug(label)}"
+                                            f"_inventory.xlsx"
+                                        ),
+                                        mime=(
+                                            "application/vnd.openxmlformats-"
+                                            "officedocument."
+                                            "spreadsheetml.sheet"
+                                        ),
+                                        key=f"qg_dl_lg_inv_xls_{key}",
+                                    )
+                                except Exception:
+                                    pass
                         else:
                             st.info(
                                 "No entities/columns were parsed from "
@@ -7560,15 +8764,36 @@ def _render_tab_quickgo():
                                 flows_df, use_container_width=True,
                                 hide_index=True,
                             )
-                            st.download_button(
-                                "⬇ Download Flows CSV",
-                                flows_df.to_csv(index=False).encode(),
-                                file_name=(
-                                    f"qg_{_slug(label)}_flows.csv"
-                                ),
-                                mime="text/csv",
-                                key=f"qg_dl_lg_flows_{key}",
-                            )
+                            fl_dl_l, fl_dl_r = st.columns([1, 1])
+                            with fl_dl_l:
+                                st.download_button(
+                                    "⬇ Flows CSV",
+                                    flows_df.to_csv(index=False).encode(),
+                                    file_name=(
+                                        f"qg_{_slug(label)}_flows.csv"
+                                    ),
+                                    mime="text/csv",
+                                    key=f"qg_dl_lg_flows_{key}",
+                                )
+                            with fl_dl_r:
+                                try:
+                                    st.download_button(
+                                        "⬇ Flows Excel",
+                                        df_to_excel_bytes(
+                                            flows_df, sheet_name="Flows",
+                                        ),
+                                        file_name=(
+                                            f"qg_{_slug(label)}_flows.xlsx"
+                                        ),
+                                        mime=(
+                                            "application/vnd.openxmlformats-"
+                                            "officedocument."
+                                            "spreadsheetml.sheet"
+                                        ),
+                                        key=f"qg_dl_lg_flows_xls_{key}",
+                                    )
+                                except Exception:
+                                    pass
                         else:
                             st.caption(
                                 "No flow rows could be derived from the "
@@ -7579,6 +8804,45 @@ def _render_tab_quickgo():
                                 "the file content was not recognized "
                                 "by the available parsers."
                             )
+
+                    # Combined Excel workbook: Inventory + Flows on
+                    # separate sheets — placed below the sub-tabs so
+                    # users can grab the whole lineage in one click.
+                    have_inv = inv_df is not None and not inv_df.empty
+                    have_flows = (flows_df is not None and
+                                  not flows_df.empty)
+                    if have_inv or have_flows:
+                        try:
+                            from io import BytesIO as _qg_lg_bio
+                            lg_buf = _qg_lg_bio()
+                            with pd.ExcelWriter(
+                                lg_buf, engine="openpyxl",
+                            ) as xw:
+                                if have_inv:
+                                    inv_df.to_excel(
+                                        xw, sheet_name="Inventory",
+                                        index=False,
+                                    )
+                                if have_flows:
+                                    flows_df.to_excel(
+                                        xw, sheet_name="Flows",
+                                        index=False,
+                                    )
+                            st.download_button(
+                                "⬇ Download Data Lineage Workbook "
+                                "(Inventory + Flows)",
+                                lg_buf.getvalue(),
+                                file_name=(
+                                    f"qg_{_slug(label)}_lineage.xlsx"
+                                ),
+                                mime=(
+                                    "application/vnd.openxmlformats-"
+                                    "officedocument.spreadsheetml.sheet"
+                                ),
+                                key=f"qg_dl_lg_workbook_{key}",
+                            )
+                        except Exception:
+                            pass
 
                 elif kind == "validation":
                     # ─────────────────────────────────────────────────
@@ -7679,6 +8943,137 @@ def _render_tab_quickgo():
                                 )
                             except Exception:
                                 st.json(sc)
+
+                        # ── 1b. Per-table (artifact) scorecard ────────
+                        # GenAI emits one row per Hub / Link / Satellite
+                        # in `table_scorecards`. Render as a sortable
+                        # dataframe with a colored readiness badge so
+                        # reviewers can triage at the table level.
+                        ts = vj.get("table_scorecards") or []
+                        if ts:
+                            st.markdown(
+                                f"**🧾 Validation Scorecard per Artifact "
+                                f"(table-level — {len(ts)} tables)**"
+                            )
+
+                            def _ts_badge(score):
+                                try:
+                                    s = int(score or 0)
+                                except Exception:
+                                    return "○"
+                                if s >= 90:
+                                    return "🟢"
+                                if s >= 75:
+                                    return "🟡"
+                                if s >= 60:
+                                    return "🟠"
+                                return "🔴"
+
+                            try:
+                                ts_rows = []
+                                for r in ts:
+                                    ts_rows.append({
+                                        "":          _ts_badge(
+                                            r.get("overall_score", 0)),
+                                        "Table":     r.get("table", ""),
+                                        "Type":      r.get(
+                                            "object_type", ""),
+                                        "Overall":   r.get(
+                                            "overall_score", 0),
+                                        "Readiness": r.get(
+                                            "readiness_level", ""),
+                                        "Structural": r.get(
+                                            "structural_score", 0),
+                                        "Bus Key":   r.get(
+                                            "business_key_score", 0),
+                                        "Relations": r.get(
+                                            "relationship_score", 0),
+                                        "Sat Design": r.get(
+                                            "satellite_design_score", 0),
+                                        "Lineage":   r.get(
+                                            "lineage_score", 0),
+                                        "Hash":      r.get(
+                                            "hash_score", 0),
+                                        "DQ":        r.get(
+                                            "data_quality_score", 0),
+                                        "Issues":    r.get(
+                                            "issues_count", 0),
+                                        "High Sev":  r.get(
+                                            "high_severity", 0),
+                                        "Summary":   r.get("summary", ""),
+                                    })
+                                ts_df = pd.DataFrame(ts_rows)
+                                # Sort by lowest overall score first
+                                # so the riskiest tables are surfaced
+                                # at the top of the triage list.
+                                try:
+                                    ts_df_sorted = ts_df.sort_values(
+                                        "Overall",
+                                        kind="mergesort",
+                                        ascending=True,
+                                    )
+                                except Exception:
+                                    ts_df_sorted = ts_df
+
+                                st.dataframe(
+                                    ts_df_sorted,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                                # Distribution caption
+                                try:
+                                    n_green = (ts_df["Overall"] >= 90).sum()
+                                    n_amber = (
+                                        (ts_df["Overall"] >= 60) &
+                                        (ts_df["Overall"] < 90)
+                                    ).sum()
+                                    n_red = (ts_df["Overall"] < 60).sum()
+                                    st.caption(
+                                        f"🟢 Production Ready: "
+                                        f"{int(n_green)}  •  "
+                                        f"🟡 Refinement / Review: "
+                                        f"{int(n_amber)}  •  "
+                                        f"🔴 Re-modeling: {int(n_red)}"
+                                    )
+                                except Exception:
+                                    pass
+                                # Downloads
+                                ts_dl_l, ts_dl_r = st.columns([1, 1])
+                                with ts_dl_l:
+                                    st.download_button(
+                                        "⬇ Per-table Scorecard CSV",
+                                        ts_df.to_csv(index=False).encode(),
+                                        file_name=(
+                                            f"qg_{_slug(label)}"
+                                            f"_table_scorecard.csv"
+                                        ),
+                                        mime="text/csv",
+                                        key=f"qg_dl_val_ts_csv_{key}",
+                                    )
+                                with ts_dl_r:
+                                    try:
+                                        st.download_button(
+                                            "⬇ Per-table Scorecard Excel",
+                                            df_to_excel_bytes(
+                                                ts_df,
+                                                sheet_name="TableScorecard",
+                                            ),
+                                            file_name=(
+                                                f"qg_{_slug(label)}"
+                                                f"_table_scorecard.xlsx"
+                                            ),
+                                            mime=(
+                                                "application/vnd."
+                                                "openxmlformats-"
+                                                "officedocument."
+                                                "spreadsheetml.sheet"
+                                            ),
+                                            key=f"qg_dl_val_ts_xls_{key}",
+                                        )
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                st.json(ts)
 
                         # ── 2. Source Interpretation Assessment ───────
                         si = vj.get("source_interpretation") or {}
@@ -9094,14 +10489,23 @@ def _render_tab_reverse():
                 st.caption(
                     f"Artifacts land in stage "
                     f"`@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE}/v<version>/` "
-                    f"then get chunked, embedded with Snowflake Cortex, "
-                    f"and stored by `(version, data_domain, "
-                    f"artifact_type)`. Re-running with the same version "
-                    f"replaces that version's rows (idempotent)."
+                    f"then get chunked and embedded. Reverse Engineering "
+                    f"artifacts go to `{VECTORS_REVERSE_ENG}`. Re-running "
+                    f"the same application + version skips already-embedded "
+                    f"chunks (idempotent)."
                 )
 
-                vcol1, vcol2 = st.columns([1, 2])
-                version_in = vcol1.text_input(
+                vcol1, vcol2, vcol3 = st.columns([1, 1, 1])
+                app_name_in = vcol1.text_input(
+                    "Application name",
+                    value=st.session_state.get("vectorize_app_name", ""),
+                    placeholder="e.g. payments_pipeline",
+                    key="vectorize_app_name_in",
+                    help="Unique identifier for this pipeline. "
+                         "Re-running with the same name + version skips "
+                         "chunks that are already embedded.",
+                )
+                version_in = vcol2.text_input(
                     "Version number",
                     value=st.session_state.get(
                         "vectorize_version", "1.0.0"
@@ -9111,18 +10515,17 @@ def _render_tab_reverse():
                     help="Used to tag every row and as the stage folder "
                          "name (special chars collapsed).",
                 )
-                embed_label = vcol2.selectbox(
+                embed_label = vcol3.selectbox(
                     "Embedding model",
                     list(EMBED_MODELS.keys()),
                     index=0,
                     key="vectorize_model_in",
-                    help="Model determines the VECTOR dimension and "
-                         "which table the vectors land in.",
+                    help="Cortex embedding model. Vectors land in the "
+                         "three phase-specific tables.",
                 )
                 if not embed_label:
                     embed_label = list(EMBED_MODELS.keys())[0]
-                embed_model, embed_dim, embed_table = \
-                    EMBED_MODELS[embed_label]
+                embed_model, embed_dim = EMBED_MODELS[embed_label]
 
                 # Preview how many chunks would be produced — cheap, no
                 # Cortex calls — so the user knows what they're committing
@@ -9141,6 +10544,13 @@ def _render_tab_reverse():
                     by_type = Counter(
                         c["artifact_type"] for c in preview_chunks
                     )
+                    by_phase = Counter(
+                        PHASE_LABELS.get(
+                            _route_chunk_to_table(c["artifact_type"]),
+                            "Unknown"
+                        )
+                        for c in preview_chunks
+                    )
                     preview_rows = pd.DataFrame([
                         {"Data Domain": d, "Chunks": n}
                         for d, n in sorted(
@@ -9149,10 +10559,10 @@ def _render_tab_reverse():
                     ])
                     st.markdown(
                         f"**Preview:** {len(preview_chunks)} chunks "
-                        f"across {len(by_domain)} domain(s) "
-                        f"and {len(by_type)} artifact type(s). "
-                        f"Domain map resolved {len(domain_map)} entities "
-                        f"from the Data Domain artifact."
+                        f"across {len(by_domain)} domain(s) and "
+                        f"{len(by_type)} artifact type(s). "
+                        f"Phase split: "
+                        + ", ".join(f"{p}: {n}" for p, n in by_phase.items())
                     )
                     if not preview_rows.empty:
                         st.dataframe(
@@ -9177,6 +10587,7 @@ def _render_tab_reverse():
                     use_container_width=True,
                     key="vectorize_run",
                     disabled=not version_in.strip()
+                             or not app_name_in.strip()
                              or not preview_chunks,
                 ):
                     try:
@@ -9214,21 +10625,23 @@ def _render_tab_reverse():
                                     f"with {embed_model}…"
                                 ),
                             )
-                        inserted = embed_and_store(
+                        counts = embed_and_store(
                             session, preview_chunks,
                             version=version_in,
+                            application_name=app_name_in,
                             embed_model=embed_model,
                             dim=embed_dim,
-                            table=embed_table,
                             progress_cb=_cb,
                         )
                         progress.progress(1.0,
-                            text=f"Inserted {inserted} rows.")
+                            text=f"Inserted {counts['total']} rows.")
+                        st.session_state["vectorize_app_name"] = app_name_in
                         st.success(
-                            f"✓ Vectorized version **{version_in}**: "
-                            f"{inserted} rows into "
-                            f"`{VECTOR_DB}.{VECTOR_SCHEMA}.{embed_table}` "
-                            f"with model `{embed_model}`"
+                            f"✓ Vectorized **{app_name_in}** v{version_in}: "
+                            f"**{counts['total']}** rows "
+                            f"(RE: {counts['reverse_eng']}, "
+                            f"FE: {counts['forward_eng']}, "
+                            f"Results: {counts['results']})"
                         )
                         # Persist so the search panel below can default to
                         # the same version/model the user just loaded
@@ -9244,8 +10657,8 @@ def _render_tab_reverse():
                 "🔎  Semantic search over stored vectors",
                 expanded=False,
             ):
-                search_model_label = st.selectbox(
-                    "Search model (must match how vectors were stored)",
+                _s_label = st.selectbox(
+                    "Embedding model",
                     list(EMBED_MODELS.keys()),
                     index=list(EMBED_MODELS.keys()).index(
                         st.session_state.get(
@@ -9256,55 +10669,65 @@ def _render_tab_reverse():
                          in EMBED_MODELS else 0,
                     key="search_model_in",
                 )
-                if not search_model_label:
-                    search_model_label = list(EMBED_MODELS.keys())[0]
-                s_model, s_dim, s_table = EMBED_MODELS[search_model_label]
+                if not _s_label:
+                    _s_label = list(EMBED_MODELS.keys())[0]
+                s_model, s_dim = EMBED_MODELS[_s_label]
 
-                # Populate filter dropdowns by querying the table for
-                # distinct values — only when the table already exists.
+                # Filters — query all three phase tables for distinct values
                 try:
-                    versions = [r["VERSION"] for r in session.sql(
-                        f"SELECT DISTINCT VERSION "
-                        f"FROM {_fqn(s_table)} "
-                        f"WHERE EMBEDDING_MODEL = ? "
-                        f"ORDER BY VERSION DESC",
-                        params=[s_model],
-                    ).collect()]
-                    domains = ["(any)"] + [r["DATA_DOMAIN"] for r in
-                        session.sql(
-                            f"SELECT DISTINCT DATA_DOMAIN "
-                            f"FROM {_fqn(s_table)} "
-                            f"WHERE EMBEDDING_MODEL = ? "
-                            f"ORDER BY DATA_DOMAIN",
-                            params=[s_model],
-                        ).collect()]
-                    types_ = ["(any)"] + [r["ARTIFACT_TYPE"] for r in
-                        session.sql(
-                            f"SELECT DISTINCT ARTIFACT_TYPE "
-                            f"FROM {_fqn(s_table)} "
-                            f"WHERE EMBEDDING_MODEL = ? "
-                            f"ORDER BY ARTIFACT_TYPE",
-                            params=[s_model],
-                        ).collect()]
+                    _phase_union = " UNION ".join(
+                        f"SELECT APPLICATION_NAME, VERSION, DATA_DOMAIN, "
+                        f"ARTIFACT_TYPE FROM {_fqn(t)} "
+                        f"WHERE EMBEDDING_MODEL = ?"
+                        for t in [VECTORS_REVERSE_ENG,
+                                  VECTORS_FORWARD_ENG,
+                                  VECTORS_RESULTS]
+                    )
+                    _all = session.sql(
+                        f"SELECT * FROM ({_phase_union}) Q",
+                        params=[s_model, s_model, s_model],
+                    ).collect()
+                    app_names = sorted({r["APPLICATION_NAME"] for r in _all})
+                    versions  = sorted({r["VERSION"] for r in _all}, reverse=True)
+                    domains   = ["(any)"] + sorted(
+                        {r["DATA_DOMAIN"] for r in _all}
+                    )
+                    types_    = ["(any)"] + sorted(
+                        {r["ARTIFACT_TYPE"] for r in _all}
+                    )
                 except Exception:
-                    versions, domains, types_ = [], ["(any)"], ["(any)"]
+                    app_names, versions = [], []
+                    domains, types_ = ["(any)"], ["(any)"]
 
                 if not versions:
                     st.info(
-                        "No vectors stored yet for this model. Run "
-                        "vectorization above first."
+                        "No vectors stored yet. Run vectorization above first."
                     )
                 else:
-                    fcol1, fcol2, fcol3 = st.columns(3)
-                    search_version = fcol1.selectbox(
+                    sc1, sc2, sc3 = st.columns(3)
+                    search_app = sc1.selectbox(
+                        "Application", ["(all)"] + app_names, index=0,
+                        key="search_app",
+                    )
+                    search_version = sc2.selectbox(
                         "Version", ["(latest)"] + versions, index=0,
                         key="search_version",
                     )
-                    search_domain = fcol2.selectbox(
+                    search_phase = sc3.selectbox(
+                        "Phase",
+                        ["(all phases)",
+                         "Reverse Engineering",
+                         "Forward Engineering",
+                         "Results"],
+                        index=0,
+                        key="search_phase",
+                    )
+                    fc1, fc2 = st.columns(2)
+                    search_domain = fc1.selectbox(
                         "Data Domain", domains, index=0,
                         key="search_domain",
                     )
-                    search_type = fcol3.selectbox(
+                    search_type = fc2.selectbox(
                         "Artifact Type", types_, index=0,
                         key="search_type",
                     )
@@ -9320,20 +10743,28 @@ def _render_tab_reverse():
                         ),
                         key="search_query",
                     )
+                    _phase_key_map = {
+                        "Reverse Engineering": "reverse_eng",
+                        "Forward Engineering": "forward_eng",
+                        "Results":             "results",
+                    }
                     if st.button("🔎 Search",
                                  type="primary",
                                  use_container_width=True,
                                  key="search_run",
                                  disabled=not query_text.strip()):
                         try:
-                            with st.spinner(f"Embedding query + "
-                                            f"ranking vectors…"):
+                            with st.spinner("Embedding query + ranking…"):
                                 hits = semantic_search(
                                     session,
                                     query=query_text,
-                                    table=s_table,
-                                    dim=s_dim,
                                     embed_model=s_model,
+                                    dim=s_dim,
+                                    application_name=(
+                                        None if search_app == "(all)"
+                                        else search_app
+                                    ),
+                                    phase=_phase_key_map.get(search_phase),
                                     version=(
                                         None
                                         if search_version == "(latest)"
@@ -9351,17 +10782,16 @@ def _render_tab_reverse():
                                     f"{'es' if len(hits) != 1 else ''} — "
                                     f"higher similarity is closer."
                                 )
-                                # Show the table
                                 st.dataframe(
                                     hits[[
-                                        "SIMILARITY", "DATA_DOMAIN",
-                                        "ARTIFACT_TYPE", "ENTITY",
-                                        "CONTENT", "VERSION",
+                                        "SIMILARITY", "PHASE",
+                                        "APPLICATION_NAME", "VERSION",
+                                        "DATA_DOMAIN", "ARTIFACT_TYPE",
+                                        "ENTITY", "CONTENT",
                                     ]],
                                     use_container_width=True,
                                     hide_index=True,
                                 )
-                                # Let the user download results
                                 st.download_button(
                                     "⬇ Download results (.csv)",
                                     data=hits.to_csv(index=False),
@@ -9423,9 +10853,9 @@ def _render_tab_forward():
     def _fwd_opt_label(row):
         last = str(row["last_loaded"])[:19] if row["last_loaded"] else ""
         return (
-            f"v{row['version']}  ·  {row['model_label']}  ·  "
-            f"{row['chunk_count']} chunks, {row['domain_count']} "
-            f"domains"
+            f"{row['application_name']}  v{row['version']}  ·  "
+            f"{row['phase']}  ·  "
+            f"{row['chunk_count']} chunks, {row['domain_count']} domains"
             + (f"  ·  {last}" if last else "")
         )
     fwd_opts = list(versions_df.apply(_fwd_opt_label, axis=1))
@@ -9669,14 +11099,32 @@ def _render_tab_forward():
             if not bv:
                 st.warning("Generate the Business Vault first.")
                 return
+            # Pull through any Raw Vault SQL + source metadata that's
+            # already been generated upstream so the Forward STTM can
+            # render true end-to-end Source → Raw Vault → Business Vault
+            # lineage rows. All extras default to empty if absent.
+            rv_sql_for_fwd = (
+                st.session_state.get("artifacts", {})
+                                .get("Raw Vault Model", {})
+                                .get("content", {})
+                                .get("sql", "") or ""
+            )
+            src_meta_for_fwd = (
+                st.session_state.get("metadata_summary", "") or ""
+            )
             with st.spinner("Generating Forward STTM…"):
                 raw = _fwd_call(build_forward_sttm_prompt(
-                    bv, reverse_summary, dashboard_type
+                    bv, reverse_summary, dashboard_type,
+                    raw_vault_sql=rv_sql_for_fwd,
+                    source_metadata_summary=src_meta_for_fwd,
                 ))
                 df = parse_table_response(raw)
             fwd["Forward STTM"] = {
                 "kind": "table",
-                "label": "STTM (Raw Vault -> Business Vault / Semantic)",
+                "label": (
+                    "End-to-End STTM "
+                    "(Source -> Raw Vault -> Business Vault)"
+                ),
                 "content": {"df": df, "raw": raw},
             }
 
@@ -10059,7 +11507,19 @@ def _render_tab_forward():
             except Exception as e:
                 st.error(f"Stage upload failed: {e}")
 
-        # Vectorize into vector table
+        # Vectorize into phase-specific vector tables
+        fwd_app_name_in = st.text_input(
+            "Application name (for vector storage)",
+            value=st.session_state.get(
+                "fwd_app_name",
+                st.session_state.get("vectorize_app_name", ""),
+            ),
+            placeholder="e.g. payments_pipeline",
+            key="fwd_app_name_in",
+            help="Must match the application name used when the Reverse "
+                 "Engineering artifacts were vectorized, so both phases "
+                 "share the same namespace.",
+        )
         embed_label = fc3.selectbox(
             "Embedding model",
             list(EMBED_MODELS.keys()),
@@ -10070,15 +11530,14 @@ def _render_tab_forward():
         if fc3.button("🧠 Store as vectors",
                       use_container_width=True,
                       key="fwd_vectorize",
-                      disabled=not fwd_vector_version_in.strip()):
+                      disabled=not fwd_vector_version_in.strip()
+                               or not fwd_app_name_in.strip()):
             if not embed_label:
                 embed_label = list(EMBED_MODELS.keys())[0]
-            em, ed, et = EMBED_MODELS[embed_label]
+            em, ed = EMBED_MODELS[embed_label]
             try:
                 with st.spinner("Ensuring vector infrastructure…"):
                     ensure_vector_infrastructure(session)
-                # Use the Data Domain artifact from FORWARD side as
-                # the domain map - it reflects the target architecture.
                 dm = extract_domain_map(fwd_arts)
                 chunks = chunk_artifacts(fwd_arts, dm)
                 if not chunks:
@@ -10092,17 +11551,22 @@ def _render_tab_forward():
                             min(1.0, done / max(1, total)),
                             text=f"Embedding {done} / {total}…",
                         )
-                    inserted = embed_and_store(
+                    counts = embed_and_store(
                         session, chunks,
                         version=fwd_vector_version_in,
-                        embed_model=em, dim=ed, table=et,
+                        application_name=fwd_app_name_in,
+                        embed_model=em, dim=ed,
                         progress_cb=_cb,
                     )
-                    progress.progress(1.0, text=f"Inserted {inserted} rows.")
+                    progress.progress(1.0,
+                        text=f"Inserted {counts['total']} rows.")
+                    st.session_state["fwd_app_name"] = fwd_app_name_in
                     st.success(
-                        f"✓ {inserted} vectors stored in "
-                        f"{VECTOR_DB}.{VECTOR_SCHEMA}.{et} "
-                        f"under version `{fwd_vector_version_in}`"
+                        f"✓ **{counts['total']}** vectors stored for "
+                        f"**{fwd_app_name_in}** v{fwd_vector_version_in} "
+                        f"(RE: {counts['reverse_eng']}, "
+                        f"FE: {counts['forward_eng']}, "
+                        f"Results: {counts['results']})"
                     )
             except Exception as e:
                 st.error(f"Vectorization failed: {e}")
@@ -10247,84 +11711,95 @@ def _render_tab_forward():
 def _render_tab_view():
     st.markdown("#### View stored artifacts")
     st.caption(
-        f"Browse artifact bundles previously uploaded to stage "
-        f"`@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE}` and indexed "
-        f"in the vector tables. Pick a version to reload the full "
-        f"artifact set — displayed exactly as in Reverse Engineering."
+        f"Browse all artifact bundles in stage "
+        f"`@{VECTOR_DB}.{VECTOR_SCHEMA}.{VECTOR_STAGE}`. "
+        f"Bundles marked ✦ have been vectorized."
     )
 
-    # Discover what's been stored
+    # ── Primary source: every ZIP on stage ───────────────────────────────
+    bundles = list_stage_bundles(session)
+
+    # ── Secondary source: vector-table entries for chunk counts ──────────
     try:
         versions_df = list_stored_versions(session)
-    except Exception as e:
+    except Exception:
         versions_df = pd.DataFrame()
-        st.error(
-            f"Could not list stored versions: {e}  "
-            f"(have you run the Store vectors step in Reverse "
-            f"Engineering at least once?)"
-        )
 
-    if versions_df.empty:
+    # Build a lookup: version_slug → list of vector rows (one per phase)
+    _vec_index: dict = {}
+    if not versions_df.empty:
+        for _, vrow in versions_df.iterrows():
+            _vec_index.setdefault(vrow["version"], []).append(vrow)
+
+    col1, col2 = st.columns([3, 1])
+    load_clicked = col2.button(
+        "🔄 Reload",
+        use_container_width=True,
+        key="view_reload",
+        help="Refresh the list of stored bundles",
+    )
+    if load_clicked:
+        st.rerun()
+
+    if not bundles:
         st.info(
-            "No versioned artifact bundles found yet. Generate "
-            "artifacts in the **Reverse Engineering** tab, then use "
-            "**Store as vector embeddings** to publish a version."
+            "No artifact bundles found on stage yet. Generate artifacts "
+            "in the **Reverse Engineering** tab and upload them to stage."
         )
-    else:
-        # Build a human-readable label per (version, model) combo
-        def _opt_label(row):
-            last = str(row["last_loaded"])[:19] if row["last_loaded"] \
-                   else ""
-            return (
-                f"v{row['version']}  ·  "
-                f"{row['model_label']}  ·  "
-                f"{row['chunk_count']} chunk"
-                f"{'s' if row['chunk_count'] != 1 else ''}, "
-                f"{row['domain_count']} domain"
-                f"{'s' if row['domain_count'] != 1 else ''}"
-                + (f"  ·  {last}" if last else "")
-            )
-        opts = list(versions_df.apply(_opt_label, axis=1))
+        return
 
-        col1, col2 = st.columns([3, 1])
-        chosen_label = col1.selectbox(
-            "Select a stored version",
-            opts,
-            index=0,
-            key="view_version_select",
-        )
-        load_clicked = col2.button(
-            "🔄 Reload",
-            use_container_width=True,
-            key="view_reload",
-            help="Refresh the list of stored versions",
-        )
-        if load_clicked:
-            st.rerun()
-        if not chosen_label and opts:
-            chosen_label = opts[0]
-        chosen_row = versions_df.iloc[opts.index(chosen_label)]
-        chosen_version = chosen_row["version"]
+    def _bundle_label(b):
+        slug = b["version_slug"]
+        vec = _vec_index.get(slug, [])
+        total_chunks = sum(r["chunk_count"] for r in vec)
+        ts = str(b.get("last_modified", ""))[:19]
+        badge = " ✦" if vec else ""
+        size_kb = b["size"] // 1024
+        label = f"v{slug}{badge}  ·  {size_kb:,} KB"
+        if total_chunks:
+            label += f"  ·  {total_chunks} vectors"
+        if ts:
+            label += f"  ·  {ts}"
+        return label
 
-        # ── Metadata card ───────────────────────────────────────────
+    opts = [_bundle_label(b) for b in bundles]
+    chosen_label = col1.selectbox(
+        "Select a stage bundle  (✦ = vectorized)",
+        opts,
+        index=0,
+        key="view_version_select",
+    )
+    if not chosen_label and opts:
+        chosen_label = opts[0]
+    chosen_bundle = bundles[opts.index(chosen_label)]
+    chosen_version = chosen_bundle["version_slug"]
+
+    # ── Vector metadata card (only for vectorized bundles) ───────────────
+    vec_rows = _vec_index.get(chosen_version, [])
+    if vec_rows:
+        total_chunks  = sum(r["chunk_count"]  for r in vec_rows)
+        total_domains = max(r["domain_count"] for r in vec_rows)
+        total_types   = max(r["type_count"]   for r in vec_rows)
+        app_name      = vec_rows[0]["application_name"]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Version", chosen_version)
-        c2.metric("Chunks", int(chosen_row["chunk_count"]))
-        c3.metric("Domains", int(chosen_row["domain_count"]))
-        c4.metric("Artifact types", int(chosen_row["type_count"]))
+        c1.metric("App", app_name)
+        c2.metric("Total chunks", total_chunks)
+        c3.metric("Domains", total_domains)
+        c4.metric("Artifact types", total_types)
 
-        # Domain breakdown for this specific version
+        # Domain breakdown from the first phase table that has data
         try:
+            first = vec_rows[0]
             dom_rows = session.sql(f"""
                 SELECT DATA_DOMAIN,
                        COUNT(*)                      AS CHUNKS,
                        COUNT(DISTINCT ARTIFACT_TYPE) AS TYPES,
                        COUNT(DISTINCT ENTITY)        AS ENTITIES
-                FROM {_fqn(chosen_row['table'])}
+                FROM {_fqn(first['table'])}
                 WHERE VERSION = ? AND EMBEDDING_MODEL = ?
                 GROUP BY DATA_DOMAIN
                 ORDER BY CHUNKS DESC
-            """, params=[chosen_version, chosen_row["model"]]).to_pandas()
+            """, params=[chosen_version, first["model"]]).to_pandas()
         except Exception:
             dom_rows = pd.DataFrame()
 
@@ -10336,102 +11811,67 @@ def _render_tab_view():
                 st.dataframe(
                     dom_rows, use_container_width=True, hide_index=True
                 )
+    else:
+        st.info(
+            f"Bundle `v{chosen_version}` is on stage but has not been "
+            f"vectorized yet. Use **Store as vectors** to index it."
+        )
 
-        # ── Locate the bundle on stage ──────────────────────────────
-        bundles = list_stage_bundles(session)
-        matching = [
-            b for b in bundles
-            if b["version_slug"] == chosen_version
-        ]
+    # ── Load and render the bundle ────────────────────────────────────────
+    bundle = chosen_bundle
+    st.caption(
+        f"Loading from stage: `{bundle['path']}` "
+        f"({bundle['size']:,} bytes)"
+    )
 
-        if not matching:
-            st.warning(
-                f"Vector rows exist for version `{chosen_version}` "
-                f"but no matching ZIP bundle found on stage. "
-                f"The stage folder may have been cleared — try "
-                f"re-uploading from Reverse Engineering."
-            )
-            with st.expander("Show chunks directly from vector table"):
-                try:
-                    raw_chunks = session.sql(f"""
-                        SELECT DATA_DOMAIN, ARTIFACT_TYPE, ENTITY,
-                               CHUNK_ID, CONTENT
-                        FROM {_fqn(chosen_row['table'])}
-                        WHERE VERSION = ? AND EMBEDDING_MODEL = ?
-                        ORDER BY DATA_DOMAIN, ARTIFACT_TYPE, CHUNK_ID
-                        LIMIT 500
-                    """, params=[chosen_version,
-                                 chosen_row["model"]]).to_pandas()
-                    st.dataframe(
-                        raw_chunks, use_container_width=True,
-                        hide_index=True
-                    )
-                except Exception as e:
-                    st.error(f"Could not fetch chunks: {e}")
-        else:
-            bundle = matching[0]
-            st.caption(
-                f"Loading from stage: `{bundle['path']}` "
-                f"({bundle['size']:,} bytes)"
-            )
-
-            # Load + cache in session state (keyed by version so
-            # switching versions triggers a reload)
-            cache_key = f"view_loaded::{chosen_version}::{chosen_row['model']}"
-            if st.session_state.get("view_active_key") != cache_key:
-                try:
-                    with st.spinner(
-                        f"Downloading and unpacking "
-                        f"v{chosen_version}…"
-                    ):
-                        loaded = load_artifacts_from_stage(
-                            session, bundle["path"]
-                        )
-                    st.session_state[cache_key]     = loaded
-                    st.session_state.view_active_key = cache_key
-                except Exception as e:
-                    st.error(f"Failed to load bundle: {e}")
-                    loaded = None
-            else:
-                loaded = st.session_state.get(cache_key)
-
-            if loaded:
-                # Summary row
-                arts = loaded.get("artifacts") or {}
-                src_fn = loaded.get("source_filename") or "—"
-                st.markdown(
-                    f"**Source files (at generation time):** `{src_fn}`  "
-                    f"·  **Artifacts in bundle:** {len(arts)}"
+    cache_key = f"view_loaded::{chosen_version}"
+    if st.session_state.get("view_active_key") != cache_key:
+        try:
+            with st.spinner(
+                f"Downloading and unpacking v{chosen_version}…"
+            ):
+                loaded = load_artifacts_from_stage(
+                    session, bundle["path"]
                 )
+            st.session_state[cache_key]      = loaded
+            st.session_state.view_active_key = cache_key
+        except Exception as e:
+            st.error(f"Failed to load bundle: {e}")
+            loaded = None
+    else:
+        loaded = st.session_state.get(cache_key)
 
-                # Let the user re-download the bundle zip too
-                try:
-                    stream = session.file.get_stream(bundle["path"])
-                    zb = stream.read()
-                    st.download_button(
-                        f"📦 Download this bundle (v{chosen_version})",
-                        data=zb,
-                        file_name=bundle["filename"],
-                        mime="application/zip",
-                        use_container_width=True,
-                        key=f"view_dl_bundle_{chosen_version}",
-                    )
-                except Exception:
-                    pass
+    if loaded:
+        arts = loaded.get("artifacts") or {}
+        src_fn = loaded.get("source_filename") or "—"
+        st.markdown(
+            f"**Source files (at generation time):** `{src_fn}`  "
+            f"·  **Artifacts in bundle:** {len(arts)}"
+        )
 
-                # ── Render artifacts using the shared helper ────────
-                if arts:
-                    st.markdown("---")
-                    st.markdown("#### Artifacts")
-                    render_artifacts(
-                        arts,
-                        key_prefix=f"view_{chosen_version}"
-                    )
-                else:
-                    st.info(
-                        "Bundle was loaded but contained no artifacts "
-                        "(empty manifest)."
-                    )
+        try:
+            stream = session.file.get_stream(bundle["path"])
+            zb = stream.read()
+            st.download_button(
+                f"📦 Download this bundle (v{chosen_version})",
+                data=zb,
+                file_name=bundle["filename"],
+                mime="application/zip",
+                use_container_width=True,
+                key=f"view_dl_bundle_{chosen_version}",
+            )
+        except Exception:
+            pass
+
+        if arts:
+            st.markdown("---")
+            st.markdown("#### Artifacts")
+            render_artifacts(
+                arts,
+                key_prefix=f"view_{chosen_version}"
+            )
+        else:
+            st.info("Bundle was loaded but contained no artifacts (empty manifest).")
 
 
 _tab_vis = get_tab_visibility()

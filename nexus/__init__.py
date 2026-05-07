@@ -26,4 +26,5 @@ from nexus.prompts import (
     build_raw_vault_narrative_prompt, build_raw_vault_sql_prompt,
     build_raw_vault_mermaid_prompt,
 )
+
 __version__ = "0.1.0-phase1"

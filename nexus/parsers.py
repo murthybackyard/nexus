@@ -26,7 +26,6 @@ Public functions:
     detect_tech_stack       — best-guess classifier from filename + head
 """
 
-
 import json
 import re
 from io import StringIO

@@ -31,6 +31,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+
 def extract_json(raw: str):
     """
     Robustly extract JSON (object or array) from an LLM response.
